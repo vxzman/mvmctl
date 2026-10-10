@@ -1,0 +1,32 @@
+{
+  "name": "rocky",
+  "description": "Rocky Linux MicroVM on Cloud-Hypervisor",
+  "backend": "cloud-hypervisor",
+  "cpus": 2,
+  "memory": "1G",
+  "autostart": true,
+  "boot": {
+    "mode": "direct",
+    "kernel": "/hypervisor/vm-rocky/boot/vmlinuz",
+    "initrd": "/hypervisor/vm-rocky/boot/initrd.img",
+    "cmdline": "console=ttyS0 root=/dev/vda rw rootwait"
+  },
+  "disks": [
+    {
+      "path": "/dev/ubuntu-vg/rocky.raw",
+      "format": "raw",
+      "direct": true
+    }
+  ],
+  "networks": [
+    {
+      "mode": "bridge",
+      "parent": "brg0",
+      "mac": "00:11:22:33:44:66"
+    }
+  ],
+  "serial": {
+    "mode": "socket",
+    "path": "/run/mvmctl/rocky-serial.sock"
+  }
+}

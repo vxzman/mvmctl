@@ -1,0 +1,34 @@
+{
+  "name": "freebsd",
+  "description": "FreeBSD VM on QEMU with UEFI and SPICE",
+  "backend": "qemu",
+  "cpus": 2,
+  "memory": "2048M",
+  "autostart": true,
+  "boot": {
+    "mode": "uefi",
+    "uefi_code": "/usr/share/OVMF/OVMF_CODE_4M.ms.fd",
+    "uefi_vars": "/var/lib/libvirt/qemu/nvram/vm08-freebsd_VARS.fd"
+  },
+  "disks": [
+    {
+      "path": "/dev/ubuntu-vg/freebsd.disk",
+      "format": "raw",
+      "cache": "none",
+      "aio": "io_uring",
+      "discard": "unmap"
+    }
+  ],
+  "networks": [
+    {
+      "mode": "macvtap",
+      "parent": "enp1s0",
+      "mac": "52:54:00:23:94:3f"
+    }
+  ],
+  "spice": {
+    "enable": true,
+    "addr": "0.0.0.0",
+    "port": 5900
+  }
+}
