@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 mod backend;
 mod config;
+mod console;
 mod generator;
 mod network;
 
@@ -66,6 +67,13 @@ enum Commands {
 
     /// List all configured MicroVMs and their status
     List,
+
+    /// Connect to a running MicroVM's serial console
+    #[command(alias = "attach")]
+    Console {
+        /// VM name or path to JSON config
+        target: String,
+    },
 
     /// Validate a JSON configuration file
     Validate {
@@ -180,6 +188,10 @@ fn main() -> Result<()> {
 
         Some(Commands::List) => {
             list_vms()?;
+        }
+
+        Some(Commands::Console { target }) => {
+            console::run_console(&target)?;
         }
 
         Some(Commands::Validate { target }) => {

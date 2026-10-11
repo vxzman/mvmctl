@@ -34,6 +34,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 RuntimeDirectory=mvmctl
+RuntimeDirectoryPreserve=yes
+SyslogIdentifier=vm-{name}
 ExecStart={bin} run "{src}"
 ExecStop={bin} stop "{src}"
 ExecStopPost=-{bin} clean "{src}"

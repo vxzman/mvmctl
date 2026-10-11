@@ -233,7 +233,17 @@ sudo systemctl stop vm-rhel
 systemctl is-enabled vm-rhel
 ```
 
-### 2. 查看所有虚拟机概览状态
+### 2. 串口控制台直连 (Serial Console)
+如果虚拟机配置了串口 Socket（如 `mode: "socket"`），可直接通过 `console` 指令接入交互式终端：
+```bash
+# 连接到 freebsd 或 rhel 的串口终端
+sudo mvmctl console freebsd
+# 或使用别名 attach
+sudo mvmctl attach freebsd
+```
+- **快捷键**：进入后即为原生串口终端，支持全键盘交互。按下 **`Ctrl + ]`** 即可安全断开退出，不影响虚拟机后台运行。
+
+### 3. 查看所有虚拟机概览状态
 ```bash
 mvmctl list
 ```

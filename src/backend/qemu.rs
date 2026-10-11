@@ -287,7 +287,9 @@ impl HypervisorBackend for QemuBackend {
         println!("Cleaning up network interfaces and sockets for VM '{}'...", config.name);
         NetworkManager::cleanup_networks(&config.name, &config.backend)?;
         let qmp_sock = format!("/run/mvmctl/{}-qmp.sock", config.name);
+        let ser_sock = format!("/run/mvmctl/{}-serial.sock", config.name);
         let _ = fs::remove_file(qmp_sock);
+        let _ = fs::remove_file(ser_sock);
         Ok(())
     }
 }
