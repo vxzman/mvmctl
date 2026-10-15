@@ -8,6 +8,8 @@ mod config;
 mod console;
 mod control;
 mod generator;
+mod mac;
+mod netlink;
 mod network;
 mod plan;
 mod registry;
@@ -122,6 +124,15 @@ fn load_vm(global: &GlobalConfig, target: &str) -> Result<(PathBuf, VmConfig)> {
     Ok(found)
 }
 
+/// `check` and `run` are the only commands that write an allocated MAC back.
+fn load_vm_and_persist(global: &GlobalConfig, target: &str) -> Result<(PathBuf, VmConfig)> {
+    let (path, _) = VmConfig::find_and_load(target, &global.config_dirs)?;
+    mac::persist_missing_macs(global, Some(&path))?;
+    let config = VmConfig::load_from_file(&path)?;
+    settings::check_vm(global, &config)?;
+    Ok((path, config))
+}
+
 fn is_systemd_generator_env(args: &[String]) -> bool {
     let prog = &args[0];
     if prog.contains("generator") {
@@ -169,7 +180,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Some(Commands::Run { target }) => {
-            let (_path, config) = load_vm(&global, &target)?;
+            let (_path, config) = load_vm_and_persist(&global, &target)?;
             let backend = get_backend(&config.backend);
             backend.run(&config, &global)?;
         }
@@ -246,7 +257,8 @@ fn main() -> Result<()> {
         }
 
         Some(Commands::Inspect { target }) => {
-            let (_path, config) = load_vm(&global, &target)?;
+            let (_path, mut config) = load_vm(&global, &target)?;
+            mac::overlay_stable_macs(&global, &mut config)?;
             let plan = ResolvedPlan::compile(&global, &config)?;
             println!("{}", serde_json::to_string_pretty(&plan)?);
         }
@@ -278,6 +290,7 @@ fn main() -> Result<()> {
 }
 
 fn run_check(global: &GlobalConfig) -> Result<()> {
+    mac::persist_missing_macs(global, None)?;
     println!(
         "Scanning configuration directories: {:?}",
         global.config_dirs

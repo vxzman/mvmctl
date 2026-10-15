@@ -176,8 +176,10 @@ impl VmConfig {
                 ));
             }
             if let Some(mac) = &net.mac {
-                validate_mac(mac)
-                    .with_context(|| format!("Invalid MAC in '{}'", path.display()))?;
+                if !crate::mac::mac_is_unset_str(mac) {
+                    validate_mac(mac)
+                        .with_context(|| format!("Invalid MAC in '{}'", path.display()))?;
+                }
             }
         }
 
@@ -231,6 +233,12 @@ impl VmConfig {
                 .join(", ")
         ))
     }
+}
+
+/// `config.json` in a search directory is the host config, not a VM.
+pub fn is_vm_config_file(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("json")
+        && path.file_name().and_then(|name| name.to_str()) != Some("config.json")
 }
 
 pub fn validate_vm_name(name: &str) -> Result<()> {

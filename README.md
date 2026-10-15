@@ -52,12 +52,12 @@
   - **QEMU**：支持 UEFI 固件启动（OVMF Code + Vars）、直接内核引导、SPICE 远程桌面、QMP 套接字优雅 ACPI 关机。
   - **Cloud-Hypervisor**：支持极速直接内核引导（vmlinuz + initrd + cmdline）、O_DIRECT 高吞吐存储、REST API 套接字优雅 ACPI 关机。
 - **网络原生编排**：
-  - 支持 **`macvtap`** 与 **`bridge` / `tap`** 模式。
+  - 支持 **`macvtap`** 与 **`bridge` / `tap`** 模式。macvtap、主网卡和 up/down 走 netlink；tap 设备用 `/dev/net/tun` 的 `TUNSETIFF` 创建，不调用 `ip`。
   - 自动管理接口命名规范（`qu-<name>` / `ch-<name>`），单/多网卡索引自动分配。
   - 关机后自动回收虚拟网络设备，防止网络接口泄漏。
 - **全生命周期自洽**：
-  - `run`：前台拉起执行（对接 systemd `ExecStart`）。
-  - `stop`：纯 Rust 实现的 QMP / HTTP API ACPI 关机协议（对接 systemd `ExecStop`）。
+  - `run`：前台拉起执行（对接 systemd `ExecStart`）。客户机在虚拟机内重启时，`mvmctl` 保持运行；若 QEMU 或 cloud-hypervisor 因重置退出，则在原进程里重新拉起。客户机关机后以状态 0 退出，`systemctl status` 显示 inactive (dead)。`systemctl status` 只表示这个进程在不在，客户机 running/paused 仍看 `mvmctl list`。
+  - `stop`：先通过 QMP / HTTP API 发 ACPI 关机。超时后强制断电（QEMU `quit`，cloud-hypervisor 先 `vm.shutdown` 再 `vmm.shutdown`）。仍未退出则返回失败，由 systemd `TimeoutStopSec` 发送 SIGKILL。
   - `clean`：自动清理网络设备与残留 Unix Socket（对接 systemd `ExecStopPost`）。
   - `list`：快速查看所有虚拟机的硬件配置、开机自启状态与当前运行状态。
 
@@ -88,7 +88,7 @@ sudo make install
 
 宿主机路径、二进制位置、网卡前缀、关机超时和 cloud-hypervisor 磁盘参数放在 `/etc/mvmctl/config.json`。单台虚拟机的 CPU、磁盘、网卡仍写在各自的 JSON 里。文件不存在时使用内置默认值，和仓库里的 `examples/config.json` 一致。
 
-用 `MVMCTL_CONFIG` 指向别的全局配置文件。`MVMCTL_CONFIG_DIR` 会插到 `config_dirs` 最前面，方便临时加一个虚拟机目录。`MVMCTL_BIN` 覆盖写进 systemd 单元的 `mvmctl` 路径。
+用 `MVMCTL_CONFIG` 指向别的全局配置文件。`MVMCTL_CONFIG_DIR` 会插到 `config_dirs` 最前面，方便临时加一个虚拟机目录。`MVMCTL_BIN` 覆盖写进 systemd 单元的 `mvmctl` 路径。搜索目录里的 `config.json` 是全局配置，不会被当成一台虚拟机。
 
 | 字段 | 默认值 | 说明 |
 | :--- | :--- | :--- |
@@ -99,7 +99,7 @@ sudo make install
 | `mvmctl_bin` | `/usr/local/bin/mvmctl` | 写入单元 `ExecStart` 的二进制；路径不存在时改用当前正在运行的程序 |
 | `runtime_dir_mode` | `"0700"` | 运行目录权限，八进制字符串 |
 | `socket_mode` | `"0600"` | 控制套接字和串口套接字权限 |
-| `stop_timeout_secs` | `45` | ACPI 关机等待秒数。超时后 `stop` 返回失败 |
+| `stop_timeout_secs` | `45` | ACPI 关机等待秒数。超时后强制断电，仍未退出则 `stop` 返回失败 |
 | `max_ifname_len` | `15` | 虚拟网卡名上限（Linux `IFNAMSIZ`） |
 | `qemu.binary` | `/usr/bin/qemu-system-x86_64` | QEMU 可执行文件 |
 | `qemu.uefi_code` | `/usr/share/OVMF/OVMF_CODE_4M.ms.fd` | 未在虚拟机里指定时使用的 OVMF code |
@@ -168,7 +168,7 @@ sudo make install
 #### 3. `networks` 网络配置
 - `mode`: 模式，`"macvtap"`（默认）或 `"bridge"`。
 - `parent`: 上联物理网卡或宿主网桥名称（例如 `"enp1s0"` 或 `"brg0"`）。
-- `mac`: 虚拟网卡 MAC 地址（例如 `"52:54:00:23:94:3f"`，可选）。
+- `mac`: 虚拟网卡 MAC。写成 `"52:54:00:23:94:3f"` 则原样使用。省略或 `""` 时，`mvmctl check` 和第一次 `mvmctl run` 会按虚拟机名和网卡序号从 `52:54:00` 分配，并写回这个 JSON。systemd generator 只用同一算法在内存里填地址，不会改配置文件。
 - `name`: 自定义虚拟接口名称（可选，默认自动命名为 `qu-<name>` 或 `ch-<name>`）。
 
 #### 4. `spice` 远程桌面配置 (QEMU)

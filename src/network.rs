@@ -1,9 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use std::fs::{self, File, OpenOptions};
 use std::path::Path;
-use std::process::Command;
 
 use crate::config::{BackendType, VmConfig};
+use crate::netlink;
 use crate::settings::{self, GlobalConfig};
 
 #[derive(Debug)]
@@ -107,71 +107,34 @@ impl NetworkManager {
     }
 
     fn setup_macvtap(ifname: &str, parent: &str, mac: Option<&str>) -> Result<()> {
-        let sys_path = format!("/sys/class/net/{ifname}");
-        let created = !Path::new(&sys_path).exists();
+        let created = !interface_exists(ifname);
         if created {
-            let mut cmd = Command::new("ip");
-            cmd.args(["link", "add", "link", parent, "name", ifname]);
-            if let Some(m) = mac {
-                cmd.args(["address", m]);
-            }
-            cmd.args(["type", "macvtap", "mode", "bridge"]);
-
-            let status = cmd
-                .status()
-                .with_context(|| format!("Failed to execute 'ip link add' for {ifname}"))?;
-            if !status.success() {
-                return Err(anyhow!("Failed to create macvtap device '{ifname}'"));
-            }
+            netlink::create_macvtap(ifname, parent, mac)?;
         }
-
-        let up_status = Command::new("ip")
-            .args(["link", "set", ifname, "up"])
-            .status()
-            .with_context(|| format!("Failed to bring up {ifname}"))?;
-        if !up_status.success() {
+        if let Err(err) = netlink::set_up(ifname) {
             if created {
                 delete_interfaces([ifname]);
             }
-            return Err(anyhow!("Failed to bring up interface '{ifname}'"));
+            return Err(err);
         }
-
         Ok(())
     }
 
     fn setup_bridge_tap(ifname: &str, parent: &str) -> Result<()> {
-        let sys_path = format!("/sys/class/net/{ifname}");
-        let created = !Path::new(&sys_path).exists();
+        let created = !interface_exists(ifname);
         if created {
-            let status = Command::new("ip")
-                .args(["tuntap", "add", ifname, "mode", "tap"])
-                .status()
-                .with_context(|| format!("Failed to create tap device {ifname}"))?;
-            if !status.success() {
-                return Err(anyhow!("Failed to create tap device '{ifname}'"));
-            }
-
-            let master_status = Command::new("ip")
-                .args(["link", "set", ifname, "master", parent])
-                .status()
-                .with_context(|| format!("Failed to attach {ifname} to bridge {parent}"))?;
-            if !master_status.success() {
+            netlink::create_tap(ifname)?;
+            if let Err(err) = netlink::set_master(ifname, parent) {
                 delete_interfaces([ifname]);
-                return Err(anyhow!("Failed to attach '{ifname}' to bridge '{parent}'"));
+                return Err(err);
             }
         }
-
-        let up_status = Command::new("ip")
-            .args(["link", "set", ifname, "up"])
-            .status()
-            .with_context(|| format!("Failed to bring up {ifname}"))?;
-        if !up_status.success() {
+        if let Err(err) = netlink::set_up(ifname) {
             if created {
                 delete_interfaces([ifname]);
             }
-            return Err(anyhow!("Failed to bring up interface '{ifname}'"));
+            return Err(err);
         }
-
         Ok(())
     }
 
@@ -195,14 +158,16 @@ impl NetworkManager {
     }
 }
 
+fn interface_exists(ifname: &str) -> bool {
+    Path::new(&format!("/sys/class/net/{ifname}")).exists()
+}
+
 pub fn delete_interfaces<I, S>(names: I)
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
     for name in names {
-        let _ = Command::new("ip")
-            .args(["link", "del", name.as_ref()])
-            .status();
+        let _ = netlink::delete_link(name.as_ref());
     }
 }

@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::config::VmConfig;
+use crate::config::{is_vm_config_file, VmConfig};
+use crate::mac;
 use crate::settings::{self, GlobalConfig, SerialTarget};
 
 #[derive(Debug, Clone)]
@@ -16,6 +17,8 @@ pub struct ResourceEntry {
 #[derive(Debug, Default)]
 pub struct ResourceRegistry {
     pub names: HashMap<String, PathBuf>,
+    /// Loaded configs with empty MACs filled in memory. Nothing is written.
+    pub configs: HashMap<String, VmConfig>,
     pub disks: HashMap<PathBuf, Vec<(String, bool)>>, // canonical_path -> Vec<(vm_name, readonly)>
     pub macs: HashMap<String, Vec<(String, String)>>, // mac_lower -> Vec<(vm_name, parent_if)>
     pub interfaces: HashMap<String, String>,          // ifname -> vm_name
@@ -56,7 +59,7 @@ impl ResourceRegistry {
             if let Ok(entries) = fs::read_dir(dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("json") {
+                    if path.is_file() && is_vm_config_file(&path) {
                         match VmConfig::load_from_file(&path) {
                             Ok(cfg) => {
                                 // Check duplicate VM names across files
@@ -84,6 +87,13 @@ impl ResourceRegistry {
                     }
                 }
             }
+        }
+
+        if let Err(err) = mac::fill_configs(&mut loaded_configs) {
+            report.errors.push(format!("MAC allocation failed: {err}"));
+        }
+        for (_, cfg) in &loaded_configs {
+            registry.configs.insert(cfg.name.clone(), cfg.clone());
         }
 
         // 2. Scan and detect resource collisions across all loaded configs
@@ -372,6 +382,48 @@ mod tests {
         assert!(text.contains("qu-app-1"), "{text}");
         assert!(report.conflicting_vms.contains("app"));
         assert!(report.conflicting_vms.contains("app-1"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_json_is_skipped_and_empty_macs_stay_on_disk() {
+        let dir = std::env::temp_dir().join(format!("mvmctl-macreg-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let global_body = "{\"stop_timeout_secs\":12}\n";
+        fs::write(dir.join("config.json"), global_body).unwrap();
+        fs::write(
+            dir.join("app.json"),
+            r#"{"name":"app","backend":"qemu","boot":{"mode":"direct","kernel":"/tmp/vmlinuz"},"networks":[{"parent":"eth0","mac":""}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("zeta.json"),
+            r#"{"name":"zeta","backend":"qemu","boot":{"mode":"direct","kernel":"/tmp/vmlinuz"},"networks":[{"parent":"eth0"}]}"#,
+        )
+        .unwrap();
+
+        let global = GlobalConfig {
+            config_dirs: vec![dir.clone()],
+            ..GlobalConfig::default()
+        };
+        let (registry, report) = ResourceRegistry::build_and_validate(&global);
+        let text = report.errors.join("\n");
+        assert!(!text.contains("config.json"), "{text}");
+        assert!(!report.conflicting_vms.contains("app"), "{text}");
+        let app = registry.configs["app"].networks[0].mac.as_deref().unwrap();
+        let zeta = registry.configs["zeta"].networks[0].mac.as_deref().unwrap();
+        assert!(app.starts_with("52:54:00:"), "{app}");
+        assert!(zeta.starts_with("52:54:00:"), "{zeta}");
+        assert_ne!(app, zeta);
+        assert_eq!(registry.macs.get(app).map(|rows| rows.len()), Some(1));
+        let raw = fs::read_to_string(dir.join("app.json")).unwrap();
+        assert!(raw.contains("\"mac\":\"\""), "{raw}");
+        assert_eq!(
+            fs::read_to_string(dir.join("config.json")).unwrap(),
+            global_body
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

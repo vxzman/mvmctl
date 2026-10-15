@@ -124,27 +124,28 @@ WantedBy=multi-user.target
                 continue;
             }
 
-            if let Ok(config) = VmConfig::load_from_file(path) {
-                let plan = ResolvedPlan::compile(global, &config)?;
-                let _ = plan.save_resolved(global);
+            let Some(config) = registry.configs.get(name) else {
+                continue;
+            };
+            let plan = ResolvedPlan::compile(global, config)?;
+            let _ = plan.save_resolved(global);
 
-                let unit_name = format!("vm-{}.service", config.name);
-                let unit_path = output_dir.join(&unit_name);
-                let unit_content = Self::generate_unit(global, &config, path);
+            let unit_name = format!("vm-{}.service", config.name);
+            let unit_path = output_dir.join(&unit_name);
+            let unit_content = Self::generate_unit(global, config, path);
 
-                if let Err(e) = fs::write(&unit_path, unit_content) {
-                    eprintln!("Failed to write {}: {e}", unit_path.display());
-                    continue;
-                }
+            if let Err(e) = fs::write(&unit_path, unit_content) {
+                eprintln!("Failed to write {}: {e}", unit_path.display());
+                continue;
+            }
 
-                if config.autostart {
-                    let wants_dir = output_dir.join("multi-user.target.wants");
-                    let _ = fs::create_dir_all(&wants_dir);
-                    let link_path = wants_dir.join(&unit_name);
-                    let _ = fs::remove_file(&link_path);
-                    let rel_target = format!("../{unit_name}");
-                    let _ = symlink(rel_target, link_path);
-                }
+            if config.autostart {
+                let wants_dir = output_dir.join("multi-user.target.wants");
+                let _ = fs::create_dir_all(&wants_dir);
+                let link_path = wants_dir.join(&unit_name);
+                let _ = fs::remove_file(&link_path);
+                let rel_target = format!("../{unit_name}");
+                let _ = symlink(rel_target, link_path);
             }
         }
 
