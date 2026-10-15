@@ -4,6 +4,8 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
 use crate::config::VmConfig;
+use crate::plan::ResolvedPlan;
+use crate::registry::ResourceRegistry;
 
 pub struct SystemdGenerator;
 
@@ -66,47 +68,48 @@ WantedBy=multi-user.target
         search_dirs.push(PathBuf::from("/etc/mvmctl/vms"));
         search_dirs.push(PathBuf::from("/usr/lib/mvmctl"));
 
-        let mut seen = std::collections::HashSet::new();
+        // Global collision detection & Resource validation
+        let (registry, report) = ResourceRegistry::build_and_validate(&search_dirs);
 
-        for dir in &search_dirs {
-            if !dir.is_dir() {
+        if !report.errors.is_empty() {
+            eprintln!("============================================================");
+            eprintln!("[mvmctl-generator] Resource conflict detection found errors:");
+            for err in &report.errors {
+                eprintln!("  ! {}", err);
+            }
+            eprintln!("============================================================");
+        }
+
+        for (name, path) in &registry.names {
+            if report.conflicting_vms.contains(name) {
+                eprintln!(
+                    "[mvmctl-generator] FAILED: Skipping unit generation for conflicting VM '{}' to prevent system disruption.",
+                    name
+                );
                 continue;
             }
-            if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("json") {
-                        let stem = path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or_default()
-                            .to_string();
 
-                        if seen.contains(&stem) {
-                            continue;
-                        }
+            if let Ok(config) = VmConfig::load_from_file(path) {
+                // Compile and cache resolved plan
+                let plan = ResolvedPlan::compile(&config);
+                let _ = plan.save_resolved();
 
-                        if let Ok(config) = VmConfig::load_from_file(&path) {
-                            seen.insert(config.name.clone());
-                            let unit_name = format!("vm-{}.service", config.name);
-                            let unit_path = output_dir.join(&unit_name);
-                            let unit_content = Self::generate_unit(&config, &path);
+                let unit_name = format!("vm-{}.service", config.name);
+                let unit_path = output_dir.join(&unit_name);
+                let unit_content = Self::generate_unit(&config, path);
 
-                            if let Err(e) = fs::write(&unit_path, unit_content) {
-                                eprintln!("Failed to write {}: {}", unit_path.display(), e);
-                                continue;
-                            }
+                if let Err(e) = fs::write(&unit_path, unit_content) {
+                    eprintln!("Failed to write {}: {}", unit_path.display(), e);
+                    continue;
+                }
 
-                            if config.autostart {
-                                let wants_dir = output_dir.join("multi-user.target.wants");
-                                let _ = fs::create_dir_all(&wants_dir);
-                                let link_path = wants_dir.join(&unit_name);
-                                let _ = fs::remove_file(&link_path);
-                                let rel_target = format!("../{}", unit_name);
-                                let _ = symlink(rel_target, link_path);
-                            }
-                        }
-                    }
+                if config.autostart {
+                    let wants_dir = output_dir.join("multi-user.target.wants");
+                    let _ = fs::create_dir_all(&wants_dir);
+                    let link_path = wants_dir.join(&unit_name);
+                    let _ = fs::remove_file(&link_path);
+                    let rel_target = format!("../{}", unit_name);
+                    let _ = symlink(rel_target, link_path);
                 }
             }
         }

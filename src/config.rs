@@ -194,11 +194,14 @@ impl VmConfig {
             return Ok((std::fs::canonicalize(&direct_path).unwrap_or(direct_path), cfg));
         }
 
-        let candidates = [
-            PathBuf::from(format!("/etc/mvmctl/{}.json", target)),
-            PathBuf::from(format!("/etc/mvmctl/vms/{}.json", target)),
-            PathBuf::from(format!("{}.json", target)),
-        ];
+        let mut candidates = Vec::new();
+        if let Ok(custom) = std::env::var("MVMCTL_CONFIG_DIR") {
+            candidates.push(PathBuf::from(custom).join(format!("{}.json", target)));
+        }
+        candidates.push(PathBuf::from(format!("/etc/mvmctl/{}.json", target)));
+        candidates.push(PathBuf::from(format!("/etc/mvmctl/vms/{}.json", target)));
+        candidates.push(PathBuf::from(format!("/usr/lib/mvmctl/{}.json", target)));
+        candidates.push(PathBuf::from(format!("{}.json", target)));
 
         for cand in &candidates {
             if cand.is_file() {

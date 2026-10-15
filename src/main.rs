@@ -8,19 +8,23 @@ mod config;
 mod console;
 mod generator;
 mod network;
+mod plan;
+mod registry;
 
 use backend::ch::CloudHypervisorBackend;
 use backend::qemu::QemuBackend;
 use backend::HypervisorBackend;
 use config::{BackendType, VmConfig};
 use generator::SystemdGenerator;
+use plan::ResolvedPlan;
+use registry::ResourceRegistry;
 
 #[derive(Parser)]
 #[command(
     name = "mvmctl",
     author = "Antigravity & kaishuai",
-    version = "0.1.0",
-    about = "MicroVM controller and systemd Quadlet-style generator for QEMU & Cloud-Hypervisor"
+    version = "0.2.0",
+    about = "MicroVM controller and systemd Quadlet-style generator with collision detection"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -75,7 +79,19 @@ enum Commands {
         target: String,
     },
 
-    /// Validate a JSON configuration file
+    /// Perform global configuration & resource collision checks (MAC, Disks, Ports, Interfaces)
+    Check,
+
+    /// Display global resource allocation ledger (MACs, disks, network interfaces, ports)
+    Resources,
+
+    /// Inspect fully resolved execution plan for a VM
+    Inspect {
+        /// VM name or path to JSON config
+        target: String,
+    },
+
+    /// Validate a single JSON configuration file
     Validate {
         /// Path to JSON config file
         target: String,
@@ -97,6 +113,17 @@ fn get_backend(backend_type: &BackendType) -> Box<dyn HypervisorBackend> {
     }
 }
 
+fn get_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(custom) = std::env::var("MVMCTL_CONFIG_DIR") {
+        dirs.push(PathBuf::from(custom));
+    }
+    dirs.push(PathBuf::from("/etc/mvmctl"));
+    dirs.push(PathBuf::from("/etc/mvmctl/vms"));
+    dirs.push(PathBuf::from("/usr/lib/mvmctl"));
+    dirs
+}
+
 fn is_systemd_generator_env(args: &[String]) -> bool {
     let prog = &args[0];
     if prog.contains("generator") {
@@ -107,7 +134,7 @@ fn is_systemd_generator_env(args: &[String]) -> bool {
         if !first.starts_with('-')
             && !matches!(
                 first.as_str(),
-                "run" | "stop" | "clean" | "generate" | "list" | "validate" | "systemd-generator" | "help"
+                "run" | "stop" | "clean" | "generate" | "list" | "console" | "attach" | "check" | "resources" | "inspect" | "validate" | "systemd-generator" | "help"
             )
         {
             if Path::new(first).is_dir() || first.contains("generator") {
@@ -194,6 +221,24 @@ fn main() -> Result<()> {
             console::run_console(&target)?;
         }
 
+        Some(Commands::Check) => {
+            run_check()?;
+        }
+
+        Some(Commands::Resources) => {
+            run_resources()?;
+        }
+
+        Some(Commands::Inspect { target }) => {
+            if let Ok(plan) = ResolvedPlan::load_resolved(&target) {
+                println!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                let (_path, config) = VmConfig::find_and_load(&target)?;
+                let plan = ResolvedPlan::compile(&config);
+                println!("{}", serde_json::to_string_pretty(&plan)?);
+            }
+        }
+
         Some(Commands::Validate { target }) => {
             let (path, config) = VmConfig::find_and_load(&target)?;
             println!("Configuration in '{}' is valid!", path.display());
@@ -217,17 +262,121 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn list_vms() -> Result<()> {
-    let mut dirs = Vec::new();
-    if let Ok(custom) = std::env::var("MVMCTL_CONFIG_DIR") {
-        dirs.push(PathBuf::from(custom));
+fn run_check() -> Result<()> {
+    let search_dirs = get_search_dirs();
+    println!("Scanning configuration directories: {:?}", search_dirs);
+    let (registry, report) = ResourceRegistry::build_and_validate(&search_dirs);
+
+    println!("\n=== Global Resource & Conflict Audit ===");
+    println!("Discovered Virtual Machines: {}", registry.names.len());
+
+    let mut all_ok = true;
+
+    // Report Disks
+    let mut disk_errors = 0;
+    for err in &report.errors {
+        if err.starts_with("Disk Conflict") {
+            eprintln!("  [✗] {}", err);
+            disk_errors += 1;
+            all_ok = false;
+        }
     }
-    dirs.push(PathBuf::from("/etc/mvmctl"));
-    dirs.push(PathBuf::from("/etc/mvmctl/vms"));
+    if disk_errors == 0 {
+        println!("  [✓] Disk Exclusivity: OK (No concurrent write collisions)");
+    }
+
+    // Report MACs
+    let mut mac_errors = 0;
+    for err in &report.errors {
+        if err.starts_with("MAC Collision") {
+            eprintln!("  [✗] {}", err);
+            mac_errors += 1;
+            all_ok = false;
+        }
+    }
+    if mac_errors == 0 {
+        println!("  [✓] MAC Addresses: OK (No duplicates found)");
+    }
+
+    // Report Interface names
+    let mut if_errors = 0;
+    for err in &report.errors {
+        if err.starts_with("Interface Name Conflict") {
+            eprintln!("  [✗] {}", err);
+            if_errors += 1;
+            all_ok = false;
+        }
+    }
+    if if_errors == 0 {
+        println!("  [✓] Virtual Network Interfaces: OK (Unique names guaranteed)");
+    }
+
+    // Report Ports & Sockets
+    let mut port_errors = 0;
+    for err in &report.errors {
+        if err.starts_with("SPICE Port") || err.starts_with("Socket Path") {
+            eprintln!("  [✗] {}", err);
+            port_errors += 1;
+            all_ok = false;
+        }
+    }
+    if port_errors == 0 {
+        println!("  [✓] Ports & IPC Sockets: OK (No overlaps)");
+    }
+
+    // Other errors
+    for err in &report.errors {
+        if !err.starts_with("Disk Conflict")
+            && !err.starts_with("MAC Collision")
+            && !err.starts_with("Interface Name Conflict")
+            && !err.starts_with("SPICE Port")
+            && !err.starts_with("Socket Path")
+        {
+            eprintln!("  [✗] {}", err);
+            all_ok = false;
+        }
+    }
+
+    for warn in &report.warnings {
+        println!("  [!] Notice: {}", warn);
+    }
+
+    println!("------------------------------------------------------------");
+    if all_ok {
+        println!("Result: All {} VM configuration(s) are valid and 100% CONFLICT-FREE!", registry.names.len());
+        Ok(())
+    } else {
+        println!("Result: Found {} conflict error(s)! Conflicting VMs: {:?}", report.errors.len(), report.conflicting_vms);
+        anyhow::bail!("Resource collision check failed.");
+    }
+}
+
+fn run_resources() -> Result<()> {
+    let search_dirs = get_search_dirs();
+    let (registry, _) = ResourceRegistry::build_and_validate(&search_dirs);
+    let entries = registry.list_resources();
+
+    println!("{:<8} {:<16} {:<32} {}", "TYPE", "VM", "IDENTIFIER", "DETAIL");
+    println!("{}", "-".repeat(80));
+
+    for item in entries {
+        println!(
+            "{:<8} {:<16} {:<32} {}",
+            item.resource_type, item.vm_name, item.identifier, item.detail
+        );
+    }
+
+    Ok(())
+}
+
+fn list_vms() -> Result<()> {
+    let dirs = get_search_dirs();
     println!("{:<16} {:<16} {:<10} {:<8} {:<10} {:<12}", "NAME", "BACKEND", "CPUS", "MEM", "AUTOSTART", "STATUS");
     println!("{}", "-".repeat(76));
 
     let mut found = 0;
+    let mut seen = std::collections::HashSet::new();
+
     for dir in &dirs {
         if !dir.is_dir() {
             continue;
@@ -237,6 +386,10 @@ fn list_vms() -> Result<()> {
                 let p = entry.path();
                 if p.extension().and_then(|s| s.to_str()) == Some("json") {
                     if let Ok(cfg) = VmConfig::load_from_file(&p) {
+                        if seen.contains(&cfg.name) {
+                            continue;
+                        }
+                        seen.insert(cfg.name.clone());
                         found += 1;
                         let status = check_vm_status(&cfg);
                         println!(
@@ -255,7 +408,7 @@ fn list_vms() -> Result<()> {
     }
 
     if found == 0 {
-        println!("No VM configurations found in /etc/mvmctl/");
+        println!("No VM configurations found in {:?}", dirs);
     }
 
     Ok(())

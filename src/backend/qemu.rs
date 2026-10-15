@@ -32,6 +32,32 @@ impl HypervisorBackend for QemuBackend {
             ));
         }
 
+        // Acquire exclusive kernel lock (flock) on writable disks to prevent accidental dual-mount
+        let mut disk_locks = Vec::new();
+        for disk in &config.disks {
+            if !disk.readonly && disk.path.exists() {
+                match fs::OpenOptions::new().read(true).write(true).open(&disk.path) {
+                    Ok(file) => {
+                        let fd = file.as_raw_fd();
+                        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                            return Err(anyhow!(
+                                "Disk '{}' is currently locked by another process! Aborting startup to prevent filesystem corruption.",
+                                disk.path.display()
+                            ));
+                        }
+                        disk_locks.push(file);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Notice: Could not acquire flock on '{}': {}",
+                            disk.path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
         // 1. Prepare networks
         let prep_nets = NetworkManager::prepare_networks(
             &config.name,
