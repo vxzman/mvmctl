@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::config::{BackendType, VmConfig};
+use crate::config::VmConfig;
+use crate::settings::{self, GlobalConfig, SerialTarget};
 
 #[derive(Debug, Clone)]
 pub struct ResourceEntry {
@@ -15,11 +16,11 @@ pub struct ResourceEntry {
 #[derive(Debug, Default)]
 pub struct ResourceRegistry {
     pub names: HashMap<String, PathBuf>,
-    pub disks: HashMap<PathBuf, Vec<(String, bool)>>,      // canonical_path -> Vec<(vm_name, readonly)>
-    pub macs: HashMap<String, Vec<(String, String)>>,       // mac_lower -> Vec<(vm_name, parent_if)>
-    pub interfaces: HashMap<String, String>,               // ifname -> vm_name
-    pub ports: HashMap<u16, String>,                       // port -> vm_name
-    pub sockets: HashMap<PathBuf, String>,                 // socket_path -> vm_name
+    pub disks: HashMap<PathBuf, Vec<(String, bool)>>, // canonical_path -> Vec<(vm_name, readonly)>
+    pub macs: HashMap<String, Vec<(String, String)>>, // mac_lower -> Vec<(vm_name, parent_if)>
+    pub interfaces: HashMap<String, String>,          // ifname -> vm_name
+    pub ports: HashMap<u16, String>,                  // port -> vm_name
+    pub sockets: HashMap<PathBuf, String>,            // socket_path -> vm_name
 }
 
 #[derive(Debug, Default)]
@@ -40,8 +41,9 @@ impl ResourceRegistry {
         fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
     }
 
-    /// Load all configs from search directories and perform comprehensive conflict detection
-    pub fn build_and_validate(search_dirs: &[PathBuf]) -> (Self, ConflictReport) {
+    /// Load all configs from the global search directories and detect conflicts.
+    pub fn build_and_validate(global: &GlobalConfig) -> (Self, ConflictReport) {
+        let search_dirs = &global.config_dirs;
         let mut registry = Self::new();
         let mut report = ConflictReport::default();
         let mut loaded_configs: Vec<(PathBuf, VmConfig)> = Vec::new();
@@ -98,9 +100,10 @@ impl ResourceRegistry {
                 if entry.len() > 1 {
                     let any_writable = entry.iter().any(|(_, ro)| !ro);
                     if any_writable {
-                        let participants: Vec<String> = entry.iter().map(|(n, ro)| {
-                            format!("{}({})", n, if *ro { "ro" } else { "rw" })
-                        }).collect();
+                        let participants: Vec<String> = entry
+                            .iter()
+                            .map(|(n, ro)| format!("{}({})", n, if *ro { "ro" } else { "rw" }))
+                            .collect();
 
                         report.errors.push(format!(
                             "Disk Conflict on '{}': Writable access declared simultaneously by multiple VMs: [{}]",
@@ -120,23 +123,30 @@ impl ResourceRegistry {
                 }
             }
 
+            if let Err(e) = settings::check_boot(global, cfg) {
+                report.errors.push(format!("VM '{}': {e}", cfg.name));
+                report.conflicting_vms.insert(cfg.name.clone());
+                vm_has_conflict = true;
+            }
+
             // (b) Network MAC and Interface Name conflict check
-            let prefix = match cfg.backend {
-                BackendType::Qemu => "qu-",
-                BackendType::CloudHypervisor => "ch-",
-            };
             let total_nets = cfg.networks.len();
 
             for (idx, net) in cfg.networks.iter().enumerate() {
-                // Determine interface name
-                let ifname = match &net.name {
-                    Some(n) => n.clone(),
-                    None => {
-                        if total_nets == 1 {
-                            format!("{}{}", prefix, cfg.name)
-                        } else {
-                            format!("{}{}-{}", prefix, cfg.name, idx)
-                        }
+                let ifname = match settings::interface_name(
+                    global,
+                    &cfg.backend,
+                    &cfg.name,
+                    net.name.as_deref(),
+                    idx,
+                    total_nets,
+                ) {
+                    Ok(name) => name,
+                    Err(e) => {
+                        report.errors.push(format!("VM '{}': {e}", cfg.name));
+                        report.conflicting_vms.insert(cfg.name.clone());
+                        vm_has_conflict = true;
+                        continue;
                     }
                 };
 
@@ -159,9 +169,10 @@ impl ResourceRegistry {
                     mac_entry.push((cfg.name.clone(), net.parent.clone()));
 
                     if mac_entry.len() > 1 {
-                        let participants: Vec<String> = mac_entry.iter().map(|(n, p)| {
-                            format!("{}(on {})", n, p)
-                        }).collect();
+                        let participants: Vec<String> = mac_entry
+                            .iter()
+                            .map(|(n, p)| format!("{}(on {})", n, p))
+                            .collect();
 
                         report.errors.push(format!(
                             "MAC Collision: Address '{}' is duplicated across VMs: [{}]",
@@ -195,26 +206,24 @@ impl ResourceRegistry {
             }
 
             // (d) Socket path conflict check
-            let sockets_to_check = match cfg.backend {
-                BackendType::Qemu => {
-                    let qmp = PathBuf::from(format!("/run/mvmctl/{}-qmp.sock", cfg.name));
-                    let serial = cfg.serial.as_ref().and_then(|s| s.path.clone())
-                        .unwrap_or_else(|| PathBuf::from(format!("/run/mvmctl/{}-serial.sock", cfg.name)));
-                    vec![qmp, serial]
+            let mut sockets_to_check = vec![global.control_socket(&cfg.backend, &cfg.name)];
+            match settings::resolve_serial(global, cfg) {
+                Ok(SerialTarget::Socket(path)) => sockets_to_check.push(path),
+                Ok(_) => {}
+                Err(e) => {
+                    report.errors.push(format!("VM '{}': {e}", cfg.name));
+                    report.conflicting_vms.insert(cfg.name.clone());
+                    vm_has_conflict = true;
                 }
-                BackendType::CloudHypervisor => {
-                    let api = PathBuf::from(format!("/run/mvmctl/{}-api.sock", cfg.name));
-                    let serial = cfg.serial.as_ref().and_then(|s| s.path.clone())
-                        .unwrap_or_else(|| PathBuf::from(format!("/run/mvmctl/{}-serial.sock", cfg.name)));
-                    vec![api, serial]
-                }
-            };
+            }
 
             for sock in sockets_to_check {
                 if let Some(existing_owner) = registry.sockets.get(&sock) {
                     report.errors.push(format!(
                         "Socket Path Conflict: '{}' is shared between '{}' and '{}'",
-                        sock.display(), existing_owner, cfg.name
+                        sock.display(),
+                        existing_owner,
+                        cfg.name
                     ));
                     report.conflicting_vms.insert(existing_owner.clone());
                     report.conflicting_vms.insert(cfg.name.clone());
@@ -248,7 +257,11 @@ impl ResourceRegistry {
                     vm_name: vm.clone(),
                     resource_type: "DISK".to_string(),
                     identifier: path.display().to_string(),
-                    detail: if *ro { "ReadOnly (Shared)".to_string() } else { "ReadWrite (Exclusive)".to_string() },
+                    detail: if *ro {
+                        "ReadOnly (Shared)".to_string()
+                    } else {
+                        "ReadWrite (Exclusive)".to_string()
+                    },
                 });
             }
         }
@@ -295,7 +308,71 @@ impl ResourceRegistry {
             });
         }
 
-        list.sort_by(|a, b| a.resource_type.cmp(&b.resource_type).then(a.vm_name.cmp(&b.vm_name)));
+        list.sort_by(|a, b| {
+            a.resource_type
+                .cmp(&b.resource_type)
+                .then(a.vm_name.cmp(&b.vm_name))
+        });
         list
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::GlobalConfig;
+    use std::fs;
+
+    #[test]
+    fn disk_and_interface_prefix_conflicts_are_reported() {
+        let dir = std::env::temp_dir().join(format!("mvmctl-reg-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let disk = dir.join("disk.img");
+        fs::write(&disk, b"x").unwrap();
+        let disk_s = disk.display().to_string();
+
+        fs::write(
+            dir.join("app.json"),
+            format!(
+                r#"{{
+                    "name":"app",
+                    "backend":"qemu",
+                    "boot":{{"mode":"direct","kernel":"/tmp/vmlinuz"}},
+                    "disks":[{{"path":"{disk_s}"}}],
+                    "networks":[
+                        {{"parent":"eth0","mac":"52:54:00:00:00:01"}},
+                        {{"parent":"eth0","mac":"52:54:00:00:00:02"}}
+                    ]
+                }}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("app-1.json"),
+            format!(
+                r#"{{
+                    "name":"app-1",
+                    "backend":"qemu",
+                    "boot":{{"mode":"direct","kernel":"/tmp/vmlinuz"}},
+                    "disks":[{{"path":"{disk_s}"}}],
+                    "networks":[{{"parent":"eth0","mac":"52:54:00:00:00:03"}}]
+                }}"#
+            ),
+        )
+        .unwrap();
+
+        let global = GlobalConfig {
+            config_dirs: vec![dir.clone()],
+            ..GlobalConfig::default()
+        };
+        let (_registry, report) = ResourceRegistry::build_and_validate(&global);
+        let text = report.errors.join("\n");
+        assert!(text.contains("Disk Conflict"), "{text}");
+        assert!(text.contains("qu-app-1"), "{text}");
+        assert!(report.conflicting_vms.contains("app"));
+        assert!(report.conflicting_vms.contains("app-1"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

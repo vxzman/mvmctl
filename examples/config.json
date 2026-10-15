@@ -1,0 +1,45 @@
+{
+  "config_dirs": [
+    "/etc/mvmctl",
+    "/etc/mvmctl/vms",
+    "/usr/lib/mvmctl"
+  ],
+  "runtime_dir": "/run/mvmctl",
+  "state_dir": "/var/lib/mvmctl",
+  "log_dir": "/var/log/mvmctl",
+  "mvmctl_bin": "/usr/local/bin/mvmctl",
+  "runtime_dir_mode": "0700",
+  "socket_mode": "0600",
+  "stop_timeout_secs": 45,
+  "max_ifname_len": 15,
+  "qemu": {
+    "binary": "/usr/bin/qemu-system-x86_64",
+    "uefi_code": "/usr/share/OVMF/OVMF_CODE_4M.ms.fd",
+    "uefi_vars_template": "/usr/share/OVMF/OVMF_VARS_4M.ms.fd",
+    "nvram_dir": "/var/lib/qemu/nvram",
+    "interface_prefix": "qu-",
+    "machine": "q35,smm=on",
+    "cpu": "host",
+    "accel": "kvm"
+  },
+  "cloud_hypervisor": {
+    "binaries": [
+      "/usr/local/bin/cloud-hypervisor-static",
+      "/usr/local/bin/cloud-hypervisor",
+      "/usr/bin/cloud-hypervisor",
+      "/usr/bin/cloud-hypervisor-static"
+    ],
+    "interface_prefix": "ch-",
+    "disk_num_queues": 2,
+    "disk_queue_size": 256,
+    "pass_image_type": true,
+    "default_cmdline": "console=ttyS0 root=/dev/vda rw rootwait",
+    "uefi_firmware": null
+  },
+  "systemd": {
+    "unit_dir": "/etc/systemd/system",
+    "timeout_stop_sec": 90,
+    "after": ["network-online.target"],
+    "wants": ["network-online.target"]
+  }
+}

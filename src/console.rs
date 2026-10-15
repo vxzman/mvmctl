@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::config::VmConfig;
+use crate::settings::{self, GlobalConfig, SerialTarget};
 
 struct RawTerminalGuard {
     orig: libc::termios,
@@ -24,7 +25,8 @@ impl RawTerminalGuard {
             }
             let mut orig: libc::termios = std::mem::zeroed();
             if libc::tcgetattr(libc::STDIN_FILENO, &mut orig) != 0 {
-                return Err(io::Error::last_os_error()).context("Failed to get terminal attributes");
+                return Err(io::Error::last_os_error())
+                    .context("Failed to get terminal attributes");
             }
             let mut raw = orig;
             libc::cfmakeraw(&mut raw);
@@ -46,26 +48,22 @@ impl Drop for RawTerminalGuard {
     }
 }
 
-pub fn find_serial_socket(target: &str) -> (String, PathBuf) {
-    let direct_socket = PathBuf::from(format!("/run/mvmctl/{}-serial.sock", target));
-    if direct_socket.exists() {
-        return (target.to_string(), direct_socket);
+pub fn find_serial_socket(global: &GlobalConfig, target: &str) -> Result<(String, PathBuf)> {
+    if let Ok((_, cfg)) = VmConfig::find_and_load(target, &global.config_dirs) {
+        return match settings::resolve_serial(global, &cfg)? {
+            SerialTarget::Socket(path) => Ok((cfg.name, path)),
+            _ => Err(anyhow!(
+                "VM '{}' serial is not in socket mode. Set serial.mode to \"socket\" to attach.",
+                cfg.name
+            )),
+        };
     }
 
-    if let Ok((_, cfg)) = VmConfig::find_and_load(target) {
-        let spath = cfg
-            .serial
-            .as_ref()
-            .and_then(|s| s.path.clone())
-            .unwrap_or_else(|| PathBuf::from(format!("/run/mvmctl/{}-serial.sock", cfg.name)));
-        return (cfg.name, spath);
-    }
-
-    (target.to_string(), direct_socket)
+    Ok((target.to_string(), global.default_serial_socket(target)))
 }
 
-pub fn run_console(target: &str) -> Result<()> {
-    let (name, socket_path) = find_serial_socket(target);
+pub fn run_console(global: &GlobalConfig, target: &str) -> Result<()> {
+    let (name, socket_path) = find_serial_socket(global, target)?;
 
     if !socket_path.exists() {
         return Err(anyhow!(
@@ -75,12 +73,20 @@ pub fn run_console(target: &str) -> Result<()> {
         ));
     }
 
-    println!("Connecting to '{}' serial console at '{}'...", name, socket_path.display());
+    println!(
+        "Connecting to '{}' serial console at '{}'...",
+        name,
+        socket_path.display()
+    );
     println!("Escape sequence: Press 'Ctrl+]' to disconnect.");
     println!("------------------------------------------------------------");
 
-    let stream = UnixStream::connect(&socket_path)
-        .with_context(|| format!("Failed to connect to serial socket '{}'", socket_path.display()))?;
+    let stream = UnixStream::connect(&socket_path).with_context(|| {
+        format!(
+            "Failed to connect to serial socket '{}'",
+            socket_path.display()
+        )
+    })?;
 
     let _guard = RawTerminalGuard::new()?;
 

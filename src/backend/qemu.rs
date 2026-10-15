@@ -1,112 +1,118 @@
 use anyhow::{anyhow, Context, Result};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
 use std::os::unix::io::AsRawFd;
-use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
-use std::thread;
 use std::time::Duration;
 
-use crate::backend::HypervisorBackend;
+use crate::backend::{ensure_runtime_dir, ignore_sigint, lock_writable_disks, HypervisorBackend};
 use crate::config::{BootMode, VmConfig};
+use crate::control::{self, qmp_execute};
 use crate::network::NetworkManager;
+use crate::settings::{self, GlobalConfig, SerialTarget};
 
 pub struct QemuBackend;
 
-impl HypervisorBackend for QemuBackend {
-    fn run(&self, config: &VmConfig) -> Result<()> {
-        fs::create_dir_all("/run/mvmctl")
-            .context("Failed to create /run/mvmctl directory")?;
+impl QemuBackend {
+    fn find_binary(global: &GlobalConfig, config: &VmConfig) -> Result<PathBuf> {
+        if let Some(path) = &config.hypervisor_path {
+            if path.is_file() {
+                return Ok(path.clone());
+            }
+            return Err(anyhow!("QEMU binary '{}' not found", path.display()));
+        }
+        if global.qemu.binary.is_file() {
+            return Ok(global.qemu.binary.clone());
+        }
+        if let Some(path) = settings::which("qemu-system-x86_64") {
+            return Ok(path);
+        }
+        Err(anyhow!(
+            "QEMU binary '{}' not found. Install qemu-system-x86_64 or set qemu.binary in config.json",
+            global.qemu.binary.display()
+        ))
+    }
+}
 
-        let bin_path = config
-            .hypervisor_path
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("/usr/bin/qemu-system-x86_64"));
-
-        if !bin_path.exists() {
+fn ensure_uefi_vars(global: &GlobalConfig, config: &VmConfig) -> Result<(PathBuf, PathBuf)> {
+    let code = config
+        .boot
+        .uefi_code
+        .clone()
+        .unwrap_or_else(|| global.qemu.uefi_code.clone());
+    let vars = config.boot.uefi_vars.clone().unwrap_or_else(|| {
+        global
+            .qemu
+            .nvram_dir
+            .join(format!("{}_VARS.fd", config.name))
+    });
+    if !vars.exists() {
+        if !global.qemu.uefi_vars_template.is_file() {
             return Err(anyhow!(
-                "QEMU binary '{}' not found. Please install qemu-system-x86_64 or specify 'hypervisor_path'",
-                bin_path.display()
+                "UEFI vars '{}' is missing and template '{}' was not found. Set qemu.uefi_vars_template in config.json",
+                vars.display(),
+                global.qemu.uefi_vars_template.display()
             ));
         }
-
-        // Acquire exclusive kernel lock (flock) on writable disks to prevent accidental dual-mount
-        let mut disk_locks = Vec::new();
-        for disk in &config.disks {
-            if !disk.readonly && disk.path.exists() {
-                match fs::OpenOptions::new().read(true).write(true).open(&disk.path) {
-                    Ok(file) => {
-                        let fd = file.as_raw_fd();
-                        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                            return Err(anyhow!(
-                                "Disk '{}' is currently locked by another process! Aborting startup to prevent filesystem corruption.",
-                                disk.path.display()
-                            ));
-                        }
-                        disk_locks.push(file);
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "Notice: Could not acquire flock on '{}': {}",
-                            disk.path.display(),
-                            e
-                        );
-                    }
-                }
-            }
+        if let Some(parent) = vars.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create '{}'", parent.display()))?;
         }
+        fs::copy(&global.qemu.uefi_vars_template, &vars).with_context(|| {
+            format!(
+                "Failed to copy UEFI vars template '{}' to '{}'",
+                global.qemu.uefi_vars_template.display(),
+                vars.display()
+            )
+        })?;
+    }
+    Ok((code, vars))
+}
 
-        // 1. Prepare networks
-        let prep_nets = NetworkManager::prepare_networks(
-            &config.name,
-            &config.backend,
-            &config.networks,
-        )?;
+impl HypervisorBackend for QemuBackend {
+    fn run(&self, config: &VmConfig, global: &GlobalConfig) -> Result<()> {
+        ensure_runtime_dir(global)?;
+        let bin_path = Self::find_binary(global, config)?;
+        let disk_locks = lock_writable_disks(config)?;
+
+        let (prep_nets, _net_guard) = NetworkManager::prepare_networks(global, config)?;
 
         let mut cmd = Command::new(&bin_path);
-        cmd.arg("-name").arg(format!("{},process={}", config.name, config.name));
-        cmd.arg("-accel").arg("kvm");
-        cmd.arg("-cpu").arg("host");
+        cmd.arg("-name")
+            .arg(format!("{},process={}", config.name, config.name));
+        cmd.arg("-accel").arg(&global.qemu.accel);
+        cmd.arg("-cpu").arg(&global.qemu.cpu);
         cmd.arg("-smp").arg(config.cpus.to_string());
         cmd.arg("-m").arg(&config.memory);
-        cmd.arg("-machine").arg("q35,smm=on");
-        cmd.arg("-global").arg("driver=cfi.pflash01,property=secure,value=on");
+        cmd.arg("-machine").arg(&global.qemu.machine);
+        cmd.arg("-global")
+            .arg("driver=cfi.pflash01,property=secure,value=on");
         cmd.arg("-device").arg("virtio-rng-pci");
         cmd.arg("-device").arg("virtio-balloon-pci");
 
-        let qmp_sock = format!("/run/mvmctl/{}-qmp.sock", config.name);
-        cmd.arg("-qmp").arg(format!("unix:{},server,nowait", qmp_sock));
+        let qmp_sock = global.control_socket(&config.backend, &config.name);
+        cmd.arg("-qmp")
+            .arg(format!("unix:{},server,nowait", qmp_sock.display()));
         cmd.arg("-display").arg("none");
 
-        // Serial console
-        if let Some(ser) = &config.serial {
-            match ser.mode.as_deref() {
-                Some("socket") => {
-                    let spath = ser
-                        .path
-                        .clone()
-                        .unwrap_or_else(|| PathBuf::from(format!("/run/mvmctl/{}-serial.sock", config.name)));
-                    cmd.arg("-serial").arg(format!("unix:{},server,nowait", spath.display()));
-                }
-                Some("file") => {
-                    let spath = ser
-                        .path
-                        .clone()
-                        .unwrap_or_else(|| PathBuf::from(format!("/var/log/mvmctl/{}.log", config.name)));
-                    cmd.arg("-serial").arg(format!("file:{}", spath.display()));
-                }
-                Some("none") => {}
-                _ => {
-                    cmd.arg("-serial").arg("mon:stdio");
-                }
+        match settings::resolve_serial(global, config)? {
+            SerialTarget::None => {}
+            SerialTarget::Socket(path) => {
+                cmd.arg("-serial")
+                    .arg(format!("unix:{},server,nowait", path.display()));
             }
-        } else {
-            cmd.arg("-serial").arg("mon:stdio");
+            SerialTarget::File(path) => {
+                if let Some(parent) = path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                cmd.arg("-serial").arg(format!("file:{}", path.display()));
+            }
+            SerialTarget::Stdio => {
+                cmd.arg("-serial").arg("mon:stdio");
+            }
         }
 
-        // Disks
         for disk in &config.disks {
             let mut opts = vec![
                 format!("file={}", disk.path.display()),
@@ -122,32 +128,21 @@ impl HypervisorBackend for QemuBackend {
             cmd.arg("-drive").arg(opts.join(","));
         }
 
-        // Boot mode
         match config.boot.mode {
             BootMode::Uefi => {
-                let ovmf_code = config
-                    .boot
-                    .uefi_code
-                    .clone()
-                    .unwrap_or_else(|| PathBuf::from("/usr/share/OVMF/OVMF_CODE_4M.ms.fd"));
-                let ovmf_vars = config
-                    .boot
-                    .uefi_vars
-                    .clone()
-                    .unwrap_or_else(|| PathBuf::from(format!("/var/lib/qemu/nvram/{}_VARS.fd", config.name)));
-
-                if let Some(parent) = ovmf_vars.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-
-                cmd.arg("-drive")
-                    .arg(format!("if=pflash,format=raw,unit=0,file={},readonly=on", ovmf_code.display()));
-                cmd.arg("-drive")
-                    .arg(format!("if=pflash,format=raw,unit=1,file={}", ovmf_vars.display()));
+                let (ovmf_code, ovmf_vars) = ensure_uefi_vars(global, config)?;
+                cmd.arg("-drive").arg(format!(
+                    "if=pflash,format=raw,unit=0,file={},readonly=on",
+                    ovmf_code.display()
+                ));
+                cmd.arg("-drive").arg(format!(
+                    "if=pflash,format=raw,unit=1,file={}",
+                    ovmf_vars.display()
+                ));
             }
             BootMode::Direct => {
-                if let Some(k) = &config.boot.kernel {
-                    cmd.arg("-kernel").arg(k);
+                if let Some(kernel) = &config.boot.kernel {
+                    cmd.arg("-kernel").arg(kernel);
                 }
                 if let Some(initrd) = &config.boot.initrd {
                     cmd.arg("-initrd").arg(initrd);
@@ -158,14 +153,13 @@ impl HypervisorBackend for QemuBackend {
             }
         }
 
-        // SPICE display
         if let Some(sp) = &config.spice {
             if sp.enable {
                 let port = sp.port.unwrap_or(5900);
                 let mut sp_opt = format!("port={},addr={}", port, sp.addr);
                 if let Some(pw) = &sp.password {
                     if !pw.is_empty() {
-                        sp_opt.push_str(&format!(",password={}", pw));
+                        sp_opt.push_str(&format!(",password={pw}"));
                     } else {
                         sp_opt.push_str(",disable-ticketing=on");
                     }
@@ -174,25 +168,32 @@ impl HypervisorBackend for QemuBackend {
                 }
                 cmd.arg("-spice").arg(sp_opt);
                 cmd.args([
-                    "-device", "virtio-vga",
-                    "-device", "qemu-xhci",
-                    "-device", "usb-tablet",
-                    "-device", "virtio-serial-pci",
-                    "-chardev", "spicevmc,id=vdagent,name=vdagent",
-                    "-device", "virtserialport,chardev=vdagent,name=com.redhat.spice.0",
-                    "-audiodev", "spice,id=snd0",
-                    "-device", "ich9-intel-hda",
-                    "-device", "hda-duplex,audiodev=snd0",
+                    "-device",
+                    "virtio-vga",
+                    "-device",
+                    "qemu-xhci",
+                    "-device",
+                    "usb-tablet",
+                    "-device",
+                    "virtio-serial-pci",
+                    "-chardev",
+                    "spicevmc,id=vdagent,name=vdagent",
+                    "-device",
+                    "virtserialport,chardev=vdagent,name=com.redhat.spice.0",
+                    "-audiodev",
+                    "spice,id=snd0",
+                    "-device",
+                    "ich9-intel-hda",
+                    "-device",
+                    "hda-duplex,audiodev=snd0",
                 ]);
             }
         }
 
-        // Extra passthrough arguments
         for extra in &config.extra_args {
             cmd.arg(extra);
         }
 
-        // Networks mapping and file descriptors passing
         let mut fd_mappings = Vec::new();
         let mut current_target_fd = 3i32;
 
@@ -205,49 +206,48 @@ impl HypervisorBackend for QemuBackend {
                 current_target_fd += 1;
                 fd_mappings.push((tap_raw, tap_target));
 
-                let (vhost_arg, _vhost_target_opt) = if vhost_raw >= 0 {
+                let vhost_arg = if vhost_raw >= 0 {
                     let vhost_target = current_target_fd;
                     current_target_fd += 1;
                     fd_mappings.push((vhost_raw, vhost_target));
-                    (format!(",vhost=on,vhostfd={}", vhost_target), Some(vhost_target))
+                    format!(",vhost=on,vhostfd={vhost_target}")
                 } else {
-                    ("".to_string(), None)
+                    String::new()
                 };
 
-                cmd.arg("-netdev").arg(format!(
-                    "tap,id=net{},fd={}{}",
-                    idx, tap_target, vhost_arg
-                ));
+                cmd.arg("-netdev")
+                    .arg(format!("tap,id=net{idx},fd={tap_target}{vhost_arg}"));
 
                 if let Some(mac) = &net.mac {
                     cmd.arg("-device")
-                        .arg(format!("virtio-net-pci,netdev=net{},mac={}", idx, mac));
+                        .arg(format!("virtio-net-pci,netdev=net{idx},mac={mac}"));
                 } else {
-                    cmd.arg("-device").arg(format!("virtio-net-pci,netdev=net{}", idx));
+                    cmd.arg("-device")
+                        .arg(format!("virtio-net-pci,netdev=net{idx}"));
                 }
             } else if net.mode == "bridge" || net.mode == "tap" {
                 cmd.arg("-netdev").arg(format!(
-                    "tap,id=net{},ifname={},script=no,downscript=no,vhost=on",
-                    idx, net.interface_name
+                    "tap,id=net{idx},ifname={},script=no,downscript=no,vhost=on",
+                    net.interface_name
                 ));
                 if let Some(mac) = &net.mac {
                     cmd.arg("-device")
-                        .arg(format!("virtio-net-pci,netdev=net{},mac={}", idx, mac));
+                        .arg(format!("virtio-net-pci,netdev=net{idx},mac={mac}"));
                 } else {
-                    cmd.arg("-device").arg(format!("virtio-net-pci,netdev=net{}", idx));
+                    cmd.arg("-device")
+                        .arg(format!("virtio-net-pci,netdev=net{idx}"));
                 }
             }
         }
 
         unsafe {
             cmd.pre_exec(move || {
+                // Child-only. QEMU creates the QMP and serial sockets with this mask.
+                libc::umask(0o077);
                 for &(src_fd, target_fd) in &fd_mappings {
-                    if src_fd >= 0 && src_fd != target_fd {
-                        if libc::dup2(src_fd, target_fd) < 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
+                    if src_fd >= 0 && src_fd != target_fd && libc::dup2(src_fd, target_fd) < 0 {
+                        return Err(std::io::Error::last_os_error());
                     }
-                    // Clear close-on-exec
                     let flags = libc::fcntl(target_fd, libc::F_GETFD);
                     if flags >= 0 {
                         libc::fcntl(target_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
@@ -261,61 +261,56 @@ impl HypervisorBackend for QemuBackend {
         let mut child = cmd
             .spawn()
             .with_context(|| format!("Failed to spawn QEMU process '{}'", bin_path.display()))?;
-
-        let status = child.wait().context("QEMU process failed during execution")?;
-        if !status.success() {
-            eprintln!("QEMU process exited with: {:?}", status);
+        ignore_sigint();
+        if let Ok(mode) = global.socket_mode_bits() {
+            if let Ok(paths) = control::socket_paths(global, config) {
+                control::tighten_sockets(paths, mode);
+            }
         }
 
+        let status = child
+            .wait()
+            .context("QEMU process failed during execution")?;
+        drop(disk_locks);
+        if !status.success() {
+            return Err(anyhow!("QEMU exited with {status}"));
+        }
         Ok(())
     }
 
-    fn stop(&self, config: &VmConfig) -> Result<()> {
-        let sock_path = format!("/run/mvmctl/{}-qmp.sock", config.name);
-        if !Path::new(&sock_path).exists() {
-            println!("QMP socket '{}' not found, VM might already be stopped.", sock_path);
+    fn stop(&self, config: &VmConfig, global: &GlobalConfig) -> Result<()> {
+        let sock = global.control_socket(&config.backend, &config.name);
+        if !sock.exists() {
+            println!(
+                "QMP socket '{}' not found, VM might already be stopped.",
+                sock.display()
+            );
             return Ok(());
         }
 
-        println!("Sending ACPI powerdown to QEMU VM '{}' via QMP...", config.name);
-        let mut stream = UnixStream::connect(&sock_path)
-            .with_context(|| format!("Failed to connect to QMP socket '{}'", sock_path))?;
-        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+        println!(
+            "Sending ACPI powerdown to QEMU VM '{}' via QMP...",
+            config.name
+        );
+        qmp_execute(&sock, "system_powerdown")?;
 
-        let mut reader = BufReader::new(stream.try_clone()?);
-        let mut greeting = String::new();
-        let _ = reader.read_line(&mut greeting);
-
-        // QMP handshake
-        stream.write_all(b"{\"execute\":\"qmp_capabilities\"}\n")?;
-        stream.flush()?;
-        let mut resp = String::new();
-        let _ = reader.read_line(&mut resp);
-
-        // Send system_powerdown
-        stream.write_all(b"{\"execute\":\"system_powerdown\"}\n")?;
-        stream.flush()?;
-
-        for _ in 0..45 {
-            if !Path::new(&sock_path).exists() {
-                println!("VM '{}' stopped successfully.", config.name);
-                return Ok(());
-            }
-            thread::sleep(Duration::from_secs(1));
+        let timeout = Duration::from_secs(global.stop_timeout_secs);
+        if control::wait_for_removal(&sock, timeout) {
+            println!("VM '{}' stopped successfully.", config.name);
+            return Ok(());
         }
-
-        println!("Warning: VM '{}' did not terminate within 45 seconds.", config.name);
-        Ok(())
+        Err(anyhow!(
+            "VM '{}' did not terminate within {} seconds",
+            config.name,
+            global.stop_timeout_secs
+        ))
     }
 
-    fn clean(&self, config: &VmConfig) -> Result<()> {
-        println!("Cleaning up network interfaces and sockets for VM '{}'...", config.name);
-        NetworkManager::cleanup_networks(&config.name, &config.backend)?;
-        let qmp_sock = format!("/run/mvmctl/{}-qmp.sock", config.name);
-        let ser_sock = format!("/run/mvmctl/{}-serial.sock", config.name);
-        let _ = fs::remove_file(qmp_sock);
-        let _ = fs::remove_file(ser_sock);
-        Ok(())
+    fn clean(&self, config: &VmConfig, global: &GlobalConfig) -> Result<()> {
+        println!(
+            "Cleaning up network interfaces and sockets for VM '{}'...",
+            config.name
+        );
+        NetworkManager::cleanup(global, config)
     }
 }

@@ -6,10 +6,12 @@ use std::path::{Path, PathBuf};
 mod backend;
 mod config;
 mod console;
+mod control;
 mod generator;
 mod network;
 mod plan;
 mod registry;
+mod settings;
 
 use backend::ch::CloudHypervisorBackend;
 use backend::qemu::QemuBackend;
@@ -18,12 +20,13 @@ use config::{BackendType, VmConfig};
 use generator::SystemdGenerator;
 use plan::ResolvedPlan;
 use registry::ResourceRegistry;
+use settings::GlobalConfig;
 
 #[derive(Parser)]
 #[command(
     name = "mvmctl",
     author = "Antigravity & kaishuai",
-    version = "0.2.0",
+    version = env!("CARGO_PKG_VERSION"),
     about = "MicroVM controller and systemd Quadlet-style generator with collision detection"
 )]
 struct Cli {
@@ -113,15 +116,10 @@ fn get_backend(backend_type: &BackendType) -> Box<dyn HypervisorBackend> {
     }
 }
 
-fn get_search_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Ok(custom) = std::env::var("MVMCTL_CONFIG_DIR") {
-        dirs.push(PathBuf::from(custom));
-    }
-    dirs.push(PathBuf::from("/etc/mvmctl"));
-    dirs.push(PathBuf::from("/etc/mvmctl/vms"));
-    dirs.push(PathBuf::from("/usr/lib/mvmctl"));
-    dirs
+fn load_vm(global: &GlobalConfig, target: &str) -> Result<(PathBuf, VmConfig)> {
+    let found = VmConfig::find_and_load(target, &global.config_dirs)?;
+    settings::check_vm(global, &found.1)?;
+    Ok(found)
 }
 
 fn is_systemd_generator_env(args: &[String]) -> bool {
@@ -134,7 +132,19 @@ fn is_systemd_generator_env(args: &[String]) -> bool {
         if !first.starts_with('-')
             && !matches!(
                 first.as_str(),
-                "run" | "stop" | "clean" | "generate" | "list" | "console" | "attach" | "check" | "resources" | "inspect" | "validate" | "systemd-generator" | "help"
+                "run"
+                    | "stop"
+                    | "clean"
+                    | "generate"
+                    | "list"
+                    | "console"
+                    | "attach"
+                    | "check"
+                    | "resources"
+                    | "inspect"
+                    | "validate"
+                    | "systemd-generator"
+                    | "help"
             )
         {
             if Path::new(first).is_dir() || first.contains("generator") {
@@ -147,32 +157,33 @@ fn is_systemd_generator_env(args: &[String]) -> bool {
 
 fn main() -> Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
+    let global = GlobalConfig::load()?;
 
     // Check if called directly by systemd as a generator
     if is_systemd_generator_env(&raw_args) {
         let output_dir = Path::new(&raw_args[1]);
-        return SystemdGenerator::run_systemd_generator(output_dir);
+        return SystemdGenerator::run_systemd_generator(&global, output_dir);
     }
 
     let cli = Cli::parse();
 
     match cli.command {
         Some(Commands::Run { target }) => {
-            let (_path, config) = VmConfig::find_and_load(&target)?;
+            let (_path, config) = load_vm(&global, &target)?;
             let backend = get_backend(&config.backend);
-            backend.run(&config)?;
+            backend.run(&config, &global)?;
         }
 
         Some(Commands::Stop { target }) => {
-            let (_path, config) = VmConfig::find_and_load(&target)?;
+            let (_path, config) = load_vm(&global, &target)?;
             let backend = get_backend(&config.backend);
-            backend.stop(&config)?;
+            backend.stop(&config, &global)?;
         }
 
         Some(Commands::Clean { target }) => {
-            let (_path, config) = VmConfig::find_and_load(&target)?;
+            let (_path, config) = load_vm(&global, &target)?;
             let backend = get_backend(&config.backend);
-            backend.clean(&config)?;
+            backend.clean(&config, &global)?;
         }
 
         Some(Commands::Generate {
@@ -182,65 +193,66 @@ fn main() -> Result<()> {
             all,
         }) => {
             if all {
-                let dest = output.unwrap_or_else(|| PathBuf::from("/etc/systemd/system"));
-                println!("Generating units for all configs in /etc/mvmctl into '{}'...", dest.display());
-                SystemdGenerator::run_systemd_generator(&dest)?;
+                let dest = output.unwrap_or_else(|| global.systemd.unit_dir.clone());
+                println!(
+                    "Generating units for configs in {:?} into '{}'...",
+                    global.config_dirs,
+                    dest.display()
+                );
+                SystemdGenerator::run_systemd_generator(&global, &dest)?;
                 println!("Done.");
                 return Ok(());
             }
 
-            let target_str = target.ok_or_else(|| {
-                anyhow!("Please specify a target configuration or use '--all'")
-            })?;
-            let (path, config) = VmConfig::find_and_load(&target_str)?;
+            let target_str = target
+                .ok_or_else(|| anyhow!("Please specify a target configuration or use '--all'"))?;
+            let (path, config) = load_vm(&global, &target_str)?;
 
             if write {
-                let dest_dir = output.unwrap_or_else(|| PathBuf::from("/etc/systemd/system"));
-                let written = SystemdGenerator::write_static_unit(&config, &path, &dest_dir)?;
+                let dest_dir = output.unwrap_or_else(|| global.systemd.unit_dir.clone());
+                let written =
+                    SystemdGenerator::write_static_unit(&global, &config, &path, &dest_dir)?;
                 println!("Wrote systemd unit to: {}", written.display());
             } else if let Some(out_path) = output {
                 if out_path.is_dir() {
-                    let written = SystemdGenerator::write_static_unit(&config, &path, &out_path)?;
+                    let written =
+                        SystemdGenerator::write_static_unit(&global, &config, &path, &out_path)?;
                     println!("Wrote systemd unit to: {}", written.display());
                 } else {
-                    let content = SystemdGenerator::generate_unit(&config, &path);
+                    let content = SystemdGenerator::generate_unit(&global, &config, &path);
                     fs::write(&out_path, content)?;
                     println!("Wrote unit to: {}", out_path.display());
                 }
             } else {
-                let content = SystemdGenerator::generate_unit(&config, &path);
+                let content = SystemdGenerator::generate_unit(&global, &config, &path);
                 print!("{}", content);
             }
         }
 
         Some(Commands::List) => {
-            list_vms()?;
+            list_vms(&global)?;
         }
 
         Some(Commands::Console { target }) => {
-            console::run_console(&target)?;
+            console::run_console(&global, &target)?;
         }
 
         Some(Commands::Check) => {
-            run_check()?;
+            run_check(&global)?;
         }
 
         Some(Commands::Resources) => {
-            run_resources()?;
+            run_resources(&global)?;
         }
 
         Some(Commands::Inspect { target }) => {
-            if let Ok(plan) = ResolvedPlan::load_resolved(&target) {
-                println!("{}", serde_json::to_string_pretty(&plan)?);
-            } else {
-                let (_path, config) = VmConfig::find_and_load(&target)?;
-                let plan = ResolvedPlan::compile(&config);
-                println!("{}", serde_json::to_string_pretty(&plan)?);
-            }
+            let (_path, config) = load_vm(&global, &target)?;
+            let plan = ResolvedPlan::compile(&global, &config)?;
+            println!("{}", serde_json::to_string_pretty(&plan)?);
         }
 
         Some(Commands::Validate { target }) => {
-            let (path, config) = VmConfig::find_and_load(&target)?;
+            let (path, config) = load_vm(&global, &target)?;
             println!("Configuration in '{}' is valid!", path.display());
             println!("  VM Name: {}", config.name);
             println!("  Backend: {}", config.backend);
@@ -248,10 +260,13 @@ fn main() -> Result<()> {
             println!("  CPUs: {}, Memory: {}", config.cpus, config.memory);
             println!("  Disks: {}", config.disks.len());
             println!("  Networks: {}", config.networks.len());
+            for warning in settings::path_warnings(&global, &config) {
+                println!("  [!] {warning}");
+            }
         }
 
         Some(Commands::SystemdGen { normal_dir, .. }) => {
-            SystemdGenerator::run_systemd_generator(&normal_dir)?;
+            SystemdGenerator::run_systemd_generator(&global, &normal_dir)?;
         }
 
         None => {
@@ -262,10 +277,12 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_check() -> Result<()> {
-    let search_dirs = get_search_dirs();
-    println!("Scanning configuration directories: {:?}", search_dirs);
-    let (registry, report) = ResourceRegistry::build_and_validate(&search_dirs);
+fn run_check(global: &GlobalConfig) -> Result<()> {
+    println!(
+        "Scanning configuration directories: {:?}",
+        global.config_dirs
+    );
+    let (registry, report) = ResourceRegistry::build_and_validate(global);
 
     println!("\n=== Global Resource & Conflict Audit ===");
     println!("Discovered Virtual Machines: {}", registry.names.len());
@@ -343,20 +360,29 @@ fn run_check() -> Result<()> {
 
     println!("------------------------------------------------------------");
     if all_ok {
-        println!("Result: All {} VM configuration(s) are valid and 100% CONFLICT-FREE!", registry.names.len());
+        println!(
+            "Result: All {} VM configuration(s) are valid and 100% CONFLICT-FREE!",
+            registry.names.len()
+        );
         Ok(())
     } else {
-        println!("Result: Found {} conflict error(s)! Conflicting VMs: {:?}", report.errors.len(), report.conflicting_vms);
+        println!(
+            "Result: Found {} conflict error(s)! Conflicting VMs: {:?}",
+            report.errors.len(),
+            report.conflicting_vms
+        );
         anyhow::bail!("Resource collision check failed.");
     }
 }
 
-fn run_resources() -> Result<()> {
-    let search_dirs = get_search_dirs();
-    let (registry, _) = ResourceRegistry::build_and_validate(&search_dirs);
+fn run_resources(global: &GlobalConfig) -> Result<()> {
+    let (registry, _) = ResourceRegistry::build_and_validate(global);
     let entries = registry.list_resources();
 
-    println!("{:<8} {:<16} {:<32} {}", "TYPE", "VM", "IDENTIFIER", "DETAIL");
+    println!(
+        "{:<8} {:<16} {:<32} {}",
+        "TYPE", "VM", "IDENTIFIER", "DETAIL"
+    );
     println!("{}", "-".repeat(80));
 
     for item in entries {
@@ -369,68 +395,47 @@ fn run_resources() -> Result<()> {
     Ok(())
 }
 
-fn list_vms() -> Result<()> {
-    let dirs = get_search_dirs();
-    println!("{:<16} {:<16} {:<10} {:<8} {:<10} {:<12}", "NAME", "BACKEND", "CPUS", "MEM", "AUTOSTART", "STATUS");
+fn list_vms(global: &GlobalConfig) -> Result<()> {
+    println!(
+        "{:<16} {:<16} {:<10} {:<8} {:<10} {:<12}",
+        "NAME", "BACKEND", "CPUS", "MEM", "AUTOSTART", "STATUS"
+    );
     println!("{}", "-".repeat(76));
 
-    let mut found = 0;
-    let mut seen = std::collections::HashSet::new();
-
-    for dir in &dirs {
-        if !dir.is_dir() {
-            continue;
-        }
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.extension().and_then(|s| s.to_str()) == Some("json") {
-                    if let Ok(cfg) = VmConfig::load_from_file(&p) {
-                        if seen.contains(&cfg.name) {
-                            continue;
-                        }
-                        seen.insert(cfg.name.clone());
-                        found += 1;
-                        let status = check_vm_status(&cfg);
-                        println!(
-                            "{:<16} {:<16} {:<10} {:<8} {:<10} {:<12}",
-                            cfg.name,
-                            cfg.backend.to_string(),
-                            cfg.cpus,
-                            cfg.memory,
-                            if cfg.autostart { "yes" } else { "no" },
-                            status
-                        );
-                    }
-                }
-            }
-        }
+    let (registry, report) = ResourceRegistry::build_and_validate(global);
+    for err in &report.errors {
+        eprintln!("  [!] {err}");
     }
 
-    if found == 0 {
-        println!("No VM configurations found in {:?}", dirs);
+    let mut rows = Vec::new();
+    for (name, path) in &registry.names {
+        if let Ok(cfg) = VmConfig::load_from_file(path) {
+            let status = if report.conflicting_vms.contains(name) {
+                "conflict".to_string()
+            } else {
+                control::vm_status(global, &cfg)
+            };
+            rows.push((cfg, status));
+        }
+    }
+    rows.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+
+    if rows.is_empty() && report.errors.is_empty() {
+        println!("No VM configurations found in {:?}", global.config_dirs);
+        return Ok(());
+    }
+
+    for (cfg, status) in &rows {
+        println!(
+            "{:<16} {:<16} {:<10} {:<8} {:<10} {:<12}",
+            cfg.name,
+            cfg.backend.to_string(),
+            cfg.cpus,
+            cfg.memory,
+            if cfg.autostart { "yes" } else { "no" },
+            status
+        );
     }
 
     Ok(())
-}
-
-fn check_vm_status(cfg: &VmConfig) -> &'static str {
-    match cfg.backend {
-        BackendType::Qemu => {
-            let sock = format!("/run/mvmctl/{}-qmp.sock", cfg.name);
-            if Path::new(&sock).exists() {
-                "running"
-            } else {
-                "stopped"
-            }
-        }
-        BackendType::CloudHypervisor => {
-            let sock = format!("/run/mvmctl/{}-api.sock", cfg.name);
-            if Path::new(&sock).exists() {
-                "running"
-            } else {
-                "stopped"
-            }
-        }
-    }
 }

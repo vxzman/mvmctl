@@ -158,28 +158,36 @@ impl VmConfig {
     }
 
     pub fn validate(&self, path: &Path) -> Result<()> {
-        if self.name.is_empty() {
-            return Err(anyhow!("VM name cannot be empty in '{}'", path.display()));
+        validate_vm_name(&self.name)
+            .with_context(|| format!("Invalid VM name in '{}'", path.display()))?;
+
+        for net in &self.networks {
+            if net.parent.is_empty() {
+                return Err(anyhow!(
+                    "Network parent cannot be empty in '{}'",
+                    path.display()
+                ));
+            }
+            let mode = net.mode.to_lowercase();
+            if !matches!(mode.as_str(), "macvtap" | "bridge" | "tap") {
+                return Err(anyhow!(
+                    "Unsupported network mode '{mode}' in '{}'",
+                    path.display()
+                ));
+            }
+            if let Some(mac) = &net.mac {
+                validate_mac(mac)
+                    .with_context(|| format!("Invalid MAC in '{}'", path.display()))?;
+            }
         }
 
-        match self.boot.mode {
-            BootMode::Direct => {
-                if let Some(kernel) = &self.boot.kernel {
-                    if !kernel.exists() {
-                        eprintln!(
-                            "Warning: Kernel path '{}' does not exist currently.",
-                            kernel.display()
-                        );
-                    }
-                } else if self.backend == BackendType::CloudHypervisor {
+        if let Some(serial) = &self.serial {
+            if let Some(mode) = serial.mode.as_deref() {
+                if !matches!(mode, "socket" | "file" | "stdio" | "tty" | "none" | "off") {
                     return Err(anyhow!(
-                        "Cloud-Hypervisor direct boot requires specifying 'boot.kernel'"
+                        "Unsupported serial mode '{mode}' in '{}'. Use socket, file, stdio, tty, or none",
+                        path.display()
                     ));
-                }
-            }
-            BootMode::Uefi => {
-                if self.backend == BackendType::CloudHypervisor {
-                    // Cloud-hypervisor uses direct kernel or direct firmware
                 }
             }
         }
@@ -187,33 +195,72 @@ impl VmConfig {
         Ok(())
     }
 
-    pub fn find_and_load(target: &str) -> Result<(PathBuf, Self)> {
+    pub fn find_and_load(target: &str, config_dirs: &[PathBuf]) -> Result<(PathBuf, Self)> {
         let direct_path = PathBuf::from(target);
         if direct_path.is_file() {
             let cfg = Self::load_from_file(&direct_path)?;
-            return Ok((std::fs::canonicalize(&direct_path).unwrap_or(direct_path), cfg));
+            return Ok((
+                std::fs::canonicalize(&direct_path).unwrap_or(direct_path),
+                cfg,
+            ));
         }
 
         let mut candidates = Vec::new();
-        if let Ok(custom) = std::env::var("MVMCTL_CONFIG_DIR") {
-            candidates.push(PathBuf::from(custom).join(format!("{}.json", target)));
+        for dir in config_dirs {
+            candidates.push(dir.join(format!("{target}.json")));
         }
-        candidates.push(PathBuf::from(format!("/etc/mvmctl/{}.json", target)));
-        candidates.push(PathBuf::from(format!("/etc/mvmctl/vms/{}.json", target)));
-        candidates.push(PathBuf::from(format!("/usr/lib/mvmctl/{}.json", target)));
-        candidates.push(PathBuf::from(format!("{}.json", target)));
+        candidates.push(PathBuf::from(format!("{target}.json")));
 
         for cand in &candidates {
             if cand.is_file() {
                 let cfg = Self::load_from_file(cand)?;
-                return Ok((std::fs::canonicalize(cand).unwrap_or_else(|_| cand.clone()), cfg));
+                return Ok((
+                    std::fs::canonicalize(cand).unwrap_or_else(|_| cand.clone()),
+                    cfg,
+                ));
             }
         }
 
         Err(anyhow!(
             "Could not locate VM config for '{}'. Searched: {}",
             target,
-            candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+            candidates
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         ))
     }
+}
+
+pub fn validate_vm_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 63 || name == "." || name == ".." {
+        return Err(anyhow!(
+            "VM name must be 1..=63 characters and not '.' or '..'"
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(anyhow!(
+            "VM name '{name}' contains characters outside [A-Za-z0-9_.-]"
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_mac(mac: &str) -> Result<()> {
+    let mut parts = mac.split(':');
+    let mut count = 0;
+    for part in parts.by_ref() {
+        count += 1;
+        if part.len() != 2 || !part.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(anyhow!("MAC '{mac}' must look like 52:54:00:00:00:01"));
+        }
+    }
+    if count != 6 {
+        return Err(anyhow!("MAC '{mac}' must look like 52:54:00:00:00:01"));
+    }
+    Ok(())
 }

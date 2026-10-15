@@ -79,7 +79,48 @@ sudo make install
 `make install` 将执行以下动作：
 1. 安装二进制文件至 `/usr/local/bin/mvmctl`。
 2. 创建配置根目录 `/etc/mvmctl/`。
-3. 创建 systemd 生成器软链接：`/etc/systemd/system-generators/mvmctl-generator -> /usr/local/bin/mvmctl`。
+3. 若 `/etc/mvmctl/config.json` 不存在，写入默认全局配置（已存在的文件不会被覆盖）。
+4. 创建 systemd 生成器软链接：`/etc/systemd/system-generators/mvmctl-generator -> /usr/local/bin/mvmctl`。
+
+---
+
+## ⚙️ 全局配置 `config.json`
+
+宿主机路径、二进制位置、网卡前缀、关机超时和 cloud-hypervisor 磁盘参数放在 `/etc/mvmctl/config.json`。单台虚拟机的 CPU、磁盘、网卡仍写在各自的 JSON 里。文件不存在时使用内置默认值，和仓库里的 `examples/config.json` 一致。
+
+用 `MVMCTL_CONFIG` 指向别的全局配置文件。`MVMCTL_CONFIG_DIR` 会插到 `config_dirs` 最前面，方便临时加一个虚拟机目录。`MVMCTL_BIN` 覆盖写进 systemd 单元的 `mvmctl` 路径。
+
+| 字段 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `config_dirs` | `/etc/mvmctl`、`/etc/mvmctl/vms`、`/usr/lib/mvmctl` | 搜索虚拟机 JSON 的目录 |
+| `runtime_dir` | `/run/mvmctl` | QMP、API、串口套接字所在目录，权限由 `runtime_dir_mode` 决定 |
+| `state_dir` | `/var/lib/mvmctl` | 解析后的执行计划 |
+| `log_dir` | `/var/log/mvmctl` | `serial.mode=file` 且未写路径时的日志目录 |
+| `mvmctl_bin` | `/usr/local/bin/mvmctl` | 写入单元 `ExecStart` 的二进制；路径不存在时改用当前正在运行的程序 |
+| `runtime_dir_mode` | `"0700"` | 运行目录权限，八进制字符串 |
+| `socket_mode` | `"0600"` | 控制套接字和串口套接字权限 |
+| `stop_timeout_secs` | `45` | ACPI 关机等待秒数。超时后 `stop` 返回失败 |
+| `max_ifname_len` | `15` | 虚拟网卡名上限（Linux `IFNAMSIZ`） |
+| `qemu.binary` | `/usr/bin/qemu-system-x86_64` | QEMU 可执行文件 |
+| `qemu.uefi_code` | `/usr/share/OVMF/OVMF_CODE_4M.ms.fd` | 未在虚拟机里指定时使用的 OVMF code |
+| `qemu.uefi_vars_template` | `/usr/share/OVMF/OVMF_VARS_4M.ms.fd` | NVRAM 文件不存在时从此模板复制 |
+| `qemu.nvram_dir` | `/var/lib/qemu/nvram` | 默认 NVRAM 目录，文件名为 `<name>_VARS.fd` |
+| `qemu.interface_prefix` | `qu-` | QEMU 网卡名前缀 |
+| `qemu.machine` / `cpu` / `accel` | `q35,smm=on` / `host` / `kvm` | 传给 QEMU 的机器、CPU、加速器 |
+| `cloud_hypervisor.binaries` | `/usr/local/bin` 与 `/usr/bin` 下的常见文件名 | 按顺序探测，都没有再查 `PATH` |
+| `cloud_hypervisor.interface_prefix` | `ch-` | cloud-hypervisor 网卡名前缀 |
+| `cloud_hypervisor.disk_num_queues` | `2` | `--disk num_queues` |
+| `cloud_hypervisor.disk_queue_size` | `256` | `--disk queue_size` |
+| `cloud_hypervisor.pass_image_type` | `true` | 为 false 时不传 `image_type`（旧版本会拒绝这个字段） |
+| `cloud_hypervisor.default_cmdline` | `console=ttyS0 root=/dev/vda rw rootwait` | 虚拟机未写 `boot.cmdline` 时使用 |
+| `cloud_hypervisor.uefi_firmware` | 空 | `boot.mode=uefi` 且虚拟机未写 `boot.uefi_code` 时的固件 |
+| `systemd.unit_dir` | `/etc/systemd/system` | `generate --write` 和 `generate --all` 的默认目录 |
+| `systemd.timeout_stop_sec` | `90` | 单元 `TimeoutStopSec`。实际取值不会小于 `stop_timeout_secs + 15` |
+| `systemd.after` / `wants` | `network-online.target` | 写进单元 `[Unit]` |
+
+块设备磁盘会额外生成对应的 `.device` 依赖；普通文件路径使用 `RequiresMountsFor=`。
+
+未写 `serial` 时，QEMU 和 cloud-hypervisor 都使用 `<runtime_dir>/<name>-serial.sock`。要回到 QEMU 的标准输入输出，写成 `"serial": {"mode": "stdio"}`。
 
 ---
 
@@ -241,6 +282,7 @@ sudo mvmctl console freebsd
 # 或使用别名 attach
 sudo mvmctl attach freebsd
 ```
+- 未写 `serial` 时，两边后端都会创建 `<runtime_dir>/<name>-serial.sock`。QEMU 若要监视器和串口共用标准输入输出，设置 `"serial": {"mode": "stdio"}`。
 - **快捷键**：进入后即为原生串口终端，支持全键盘交互。按下 **`Ctrl + ]`** 即可安全断开退出，不影响虚拟机后台运行。
 
 ### 3. 查看所有虚拟机概览状态

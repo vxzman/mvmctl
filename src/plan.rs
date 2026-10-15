@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use crate::config::{BackendType, BootConfig, SerialConfig, SpiceConfig, VmConfig};
 use crate::registry::ResourceRegistry;
+use crate::settings::{self, GlobalConfig, SerialTarget};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedNetwork {
@@ -46,36 +47,26 @@ pub struct ResolvedPlan {
 }
 
 impl ResolvedPlan {
-    pub fn compile(config: &VmConfig) -> Self {
-        let prefix = match config.backend {
-            BackendType::Qemu => "qu-",
-            BackendType::CloudHypervisor => "ch-",
-        };
+    pub fn compile(global: &GlobalConfig, config: &VmConfig) -> Result<Self> {
         let total_nets = config.networks.len();
 
-        let resolved_networks: Vec<ResolvedNetwork> = config
-            .networks
-            .iter()
-            .enumerate()
-            .map(|(idx, net)| {
-                let ifname = match &net.name {
-                    Some(n) => n.clone(),
-                    None => {
-                        if total_nets == 1 {
-                            format!("{}{}", prefix, config.name)
-                        } else {
-                            format!("{}{}-{}", prefix, config.name, idx)
-                        }
-                    }
-                };
-                ResolvedNetwork {
-                    mode: net.mode.clone(),
-                    parent: net.parent.clone(),
-                    mac: net.mac.as_ref().map(|m| m.to_lowercase()),
-                    interface_name: ifname,
-                }
-            })
-            .collect();
+        let mut resolved_networks = Vec::with_capacity(total_nets);
+        for (idx, net) in config.networks.iter().enumerate() {
+            let ifname = settings::interface_name(
+                global,
+                &config.backend,
+                &config.name,
+                net.name.as_deref(),
+                idx,
+                total_nets,
+            )?;
+            resolved_networks.push(ResolvedNetwork {
+                mode: net.mode.clone(),
+                parent: net.parent.clone(),
+                mac: net.mac.as_ref().map(|m| m.to_lowercase()),
+                interface_name: ifname,
+            });
+        }
 
         let resolved_disks: Vec<ResolvedDisk> = config
             .disks
@@ -92,28 +83,13 @@ impl ResolvedPlan {
             })
             .collect();
 
-        let (qmp_or_api, serial_sock) = match config.backend {
-            BackendType::Qemu => {
-                let qmp = PathBuf::from(format!("/run/mvmctl/{}-qmp.sock", config.name));
-                let ser = config
-                    .serial
-                    .as_ref()
-                    .and_then(|s| s.path.clone())
-                    .or_else(|| Some(PathBuf::from(format!("/run/mvmctl/{}-serial.sock", config.name))));
-                (qmp, ser)
-            }
-            BackendType::CloudHypervisor => {
-                let api = PathBuf::from(format!("/run/mvmctl/{}-api.sock", config.name));
-                let ser = config
-                    .serial
-                    .as_ref()
-                    .and_then(|s| s.path.clone())
-                    .or_else(|| Some(PathBuf::from(format!("/run/mvmctl/{}-serial.sock", config.name))));
-                (api, ser)
-            }
+        let qmp_or_api = global.control_socket(&config.backend, &config.name);
+        let serial_sock = match settings::resolve_serial(global, config)? {
+            SerialTarget::Socket(path) => Some(path),
+            _ => None,
         };
 
-        ResolvedPlan {
+        Ok(ResolvedPlan {
             name: config.name.clone(),
             description: config
                 .description
@@ -132,15 +108,12 @@ impl ResolvedPlan {
             extra_args: config.extra_args.clone(),
             qmp_or_api_socket: qmp_or_api,
             serial_socket: serial_sock,
-        }
+        })
     }
 
-    /// Save compiled plan into /var/lib/mvmctl/resolved/ or fallback /run/mvmctl/resolved/
-    pub fn save_resolved(&self) -> Result<PathBuf> {
-        let candidate_dirs = [
-            PathBuf::from("/var/lib/mvmctl/resolved"),
-            PathBuf::from("/run/mvmctl/resolved"),
-        ];
+    /// Save compiled plan into `<state_dir>/resolved`, falling back to `<runtime_dir>/resolved`.
+    pub fn save_resolved(&self, global: &GlobalConfig) -> Result<PathBuf> {
+        let candidate_dirs = global.resolved_dirs();
 
         let mut target_dir = candidate_dirs[1].clone();
         for dir in &candidate_dirs {
@@ -151,27 +124,10 @@ impl ResolvedPlan {
         }
 
         let target_file = target_dir.join(format!("{}.json", self.name));
-        let content = serde_json::to_string_pretty(self)
-            .context("Failed to serialize resolved plan")?;
+        let content =
+            serde_json::to_string_pretty(self).context("Failed to serialize resolved plan")?;
         fs::write(&target_file, content)
             .with_context(|| format!("Failed to write plan to '{}'", target_file.display()))?;
         Ok(target_file)
-    }
-
-    pub fn load_resolved(name: &str) -> Result<Self> {
-        let candidates = [
-            PathBuf::from(format!("/var/lib/mvmctl/resolved/{}.json", name)),
-            PathBuf::from(format!("/run/mvmctl/resolved/{}.json", name)),
-        ];
-
-        for cand in &candidates {
-            if cand.is_file() {
-                let content = fs::read_to_string(cand)?;
-                let plan: ResolvedPlan = serde_json::from_str(&content)?;
-                return Ok(plan);
-            }
-        }
-
-        anyhow::bail!("Resolved plan for '{}' not found.", name)
     }
 }

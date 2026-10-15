@@ -1,180 +1,127 @@
 use anyhow::{anyhow, Context, Result};
-use std::fs;
-use std::io::{BufRead, BufReader, Write};
 use std::os::unix::io::AsRawFd;
-use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
-use std::thread;
 use std::time::Duration;
 
-use crate::backend::HypervisorBackend;
-use crate::config::VmConfig;
+use crate::backend::{ensure_runtime_dir, ignore_sigint, lock_writable_disks, HypervisorBackend};
+use crate::config::{BootMode, VmConfig};
+use crate::control::{self, ch_request};
 use crate::network::NetworkManager;
+use crate::settings::{self, firmware_path, GlobalConfig, SerialTarget};
 
 pub struct CloudHypervisorBackend;
 
 impl CloudHypervisorBackend {
-    fn find_binary(config: &VmConfig) -> Result<PathBuf> {
-        if let Some(p) = &config.hypervisor_path {
-            if p.exists() {
-                return Ok(p.clone());
+    fn find_binary(global: &GlobalConfig, config: &VmConfig) -> Result<PathBuf> {
+        if let Some(path) = &config.hypervisor_path {
+            if path.is_file() {
+                return Ok(path.clone());
+            }
+            return Err(anyhow!(
+                "Cloud-Hypervisor binary '{}' not found",
+                path.display()
+            ));
+        }
+        for candidate in &global.cloud_hypervisor.binaries {
+            if candidate.is_file() {
+                return Ok(candidate.clone());
             }
         }
-
-        let candidates = [
-            PathBuf::from("/usr/local/bin/cloud-hypervisor-static"),
-            PathBuf::from("/usr/local/bin/cloud-hypervisor"),
-            PathBuf::from("/usr/bin/cloud-hypervisor"),
-            PathBuf::from("/usr/bin/cloud-hypervisor-static"),
-        ];
-
-        for c in &candidates {
-            if c.exists() {
-                return Ok(c.clone());
-            }
-        }
-
-        if let Ok(path) = which::which("cloud-hypervisor") {
+        if let Some(path) = settings::which("cloud-hypervisor") {
             return Ok(path);
         }
-
         Err(anyhow!(
-            "Cloud-Hypervisor binary not found. Please install it or specify 'hypervisor_path'."
+            "Cloud-Hypervisor binary not found. Install it or set cloud_hypervisor.binaries in config.json"
         ))
     }
 }
 
-mod which {
-    use std::path::PathBuf;
-    pub fn which(name: &str) -> Result<PathBuf, ()> {
-        if let Ok(paths) = std::env::var("PATH") {
-            for p in std::env::split_paths(&paths) {
-                let full = p.join(name);
-                if full.is_file() {
-                    return Ok(full);
-                }
-            }
-        }
-        Err(())
-    }
-}
-
 impl HypervisorBackend for CloudHypervisorBackend {
-    fn run(&self, config: &VmConfig) -> Result<()> {
-        fs::create_dir_all("/run/mvmctl")
-            .context("Failed to create /run/mvmctl directory")?;
+    fn run(&self, config: &VmConfig, global: &GlobalConfig) -> Result<()> {
+        ensure_runtime_dir(global)?;
+        let bin_path = Self::find_binary(global, config)?;
 
-        let bin_path = Self::find_binary(config)?;
+        // Probe the lock, then release it. cloud-hypervisor >= v46 flocks the
+        // disk itself and fails if this process still holds LOCK_EX.
+        drop(lock_writable_disks(config)?);
 
-        let kernel = config
-            .boot
-            .kernel
-            .as_ref()
-            .ok_or_else(|| anyhow!("Cloud-Hypervisor requires 'boot.kernel' to be specified."))?;
-
-        // Acquire exclusive kernel lock (flock) on writable disks to prevent accidental dual-mount
-        let mut disk_locks = Vec::new();
-        for disk in &config.disks {
-            if !disk.readonly && disk.path.exists() {
-                match fs::OpenOptions::new().read(true).write(true).open(&disk.path) {
-                    Ok(file) => {
-                        let fd = file.as_raw_fd();
-                        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                            return Err(anyhow!(
-                                "Disk '{}' is currently locked by another process! Aborting startup to prevent filesystem corruption.",
-                                disk.path.display()
-                            ));
-                        }
-                        disk_locks.push(file);
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "Notice: Could not acquire flock on '{}': {}",
-                            disk.path.display(),
-                            e
-                        );
-                    }
-                }
-            }
-        }
-
-        let prep_nets = NetworkManager::prepare_networks(
-            &config.name,
-            &config.backend,
-            &config.networks,
-        )?;
+        let (prep_nets, _net_guard) = NetworkManager::prepare_networks(global, config)?;
 
         let mut cmd = Command::new(&bin_path);
         cmd.arg("--cpus").arg(format!("boot={}", config.cpus));
         cmd.arg("--memory").arg(format!("size={}", config.memory));
-        cmd.arg("--kernel").arg(kernel);
 
-        let cmdline = config
-            .boot
-            .cmdline
-            .as_deref()
-            .unwrap_or("console=ttyS0 root=/dev/vda rw rootwait");
-        cmd.arg("--cmdline").arg(cmdline);
-
-        let api_socket = format!("/run/mvmctl/{}-api.sock", config.name);
-        cmd.arg("--api-socket").arg(format!("path={}", api_socket));
-
-        if let Some(initrd) = &config.boot.initrd {
-            cmd.arg("--initramfs").arg(initrd);
+        match config.boot.mode {
+            BootMode::Direct => {
+                let kernel = config.boot.kernel.as_ref().ok_or_else(|| {
+                    anyhow!("Cloud-Hypervisor direct boot requires 'boot.kernel'")
+                })?;
+                cmd.arg("--kernel").arg(kernel);
+                if let Some(initrd) = &config.boot.initrd {
+                    cmd.arg("--initramfs").arg(initrd);
+                }
+                let cmdline = config
+                    .boot
+                    .cmdline
+                    .as_deref()
+                    .unwrap_or(global.cloud_hypervisor.default_cmdline.as_str());
+                cmd.arg("--cmdline").arg(cmdline);
+            }
+            BootMode::Uefi => {
+                let firmware = firmware_path(global, config).ok_or_else(|| {
+                    anyhow!(
+                        "Cloud-Hypervisor UEFI boot requires 'boot.uefi_code' or cloud_hypervisor.uefi_firmware"
+                    )
+                })?;
+                cmd.arg("--firmware").arg(firmware);
+            }
         }
+
+        let api_socket = global.control_socket(&config.backend, &config.name);
+        cmd.arg("--api-socket")
+            .arg(format!("path={}", api_socket.display()));
 
         for disk in &config.disks {
-            let direct_str = if disk.direct { "on" } else { "off" };
-            let disk_arg = format!(
-                "path={},image_type={},direct={},num_queues=2,queue_size=256",
-                disk.path.display(),
-                disk.format,
-                direct_str
-            );
-            cmd.arg("--disk").arg(disk_arg);
-        }
-
-        // Serial configuration
-        if let Some(ser) = &config.serial {
-            match ser.mode.as_deref() {
-                Some("socket") => {
-                    let spath = ser
-                        .path
-                        .clone()
-                        .unwrap_or_else(|| PathBuf::from(format!("/run/mvmctl/{}-serial.sock", config.name)));
-                    cmd.arg("--serial").arg(format!("socket={}", spath.display()));
-                }
-                Some("file") => {
-                    let spath = ser
-                        .path
-                        .clone()
-                        .unwrap_or_else(|| PathBuf::from(format!("/var/log/mvmctl/{}.log", config.name)));
-                    cmd.arg("--serial").arg(format!("file={}", spath.display()));
-                }
-                Some("tty") => {
-                    cmd.arg("--serial").arg("tty");
-                }
-                Some("none") => {
-                    cmd.arg("--serial").arg("off");
-                }
-                _ => {
-                    let def_socket = format!("/run/mvmctl/{}-serial.sock", config.name);
-                    cmd.arg("--serial").arg(format!("socket={}", def_socket));
-                }
+            let mut parts = vec![
+                format!("path={}", disk.path.display()),
+                format!("direct={}", if disk.direct { "on" } else { "off" }),
+                format!("num_queues={}", global.cloud_hypervisor.disk_num_queues),
+                format!("queue_size={}", global.cloud_hypervisor.disk_queue_size),
+            ];
+            if global.cloud_hypervisor.pass_image_type {
+                parts.insert(1, format!("image_type={}", disk.format));
             }
-        } else {
-            let def_socket = format!("/run/mvmctl/{}-serial.sock", config.name);
-            cmd.arg("--serial").arg(format!("socket={}", def_socket));
+            if disk.readonly {
+                parts.push("readonly=on".to_string());
+            }
+            cmd.arg("--disk").arg(parts.join(","));
         }
 
-        // Extra passthrough arguments
+        match settings::resolve_serial(global, config)? {
+            SerialTarget::None => {
+                cmd.arg("--serial").arg("off");
+            }
+            SerialTarget::Socket(path) => {
+                cmd.arg("--serial")
+                    .arg(format!("socket={}", path.display()));
+            }
+            SerialTarget::File(path) => {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                cmd.arg("--serial").arg(format!("file={}", path.display()));
+            }
+            SerialTarget::Stdio => {
+                cmd.arg("--serial").arg("tty");
+            }
+        }
+
         for extra in &config.extra_args {
             cmd.arg(extra);
         }
 
-        // Network arguments and inherited file descriptors
         let mut fd_mappings = Vec::new();
         let mut current_target_fd = 3i32;
 
@@ -186,29 +133,26 @@ impl HypervisorBackend for CloudHypervisorBackend {
                 fd_mappings.push((tap_raw, tap_target));
 
                 if let Some(mac) = &net.mac {
-                    cmd.arg("--net")
-                        .arg(format!("fd={},mac={}", tap_target, mac));
+                    cmd.arg("--net").arg(format!("fd={tap_target},mac={mac}"));
                 } else {
-                    cmd.arg("--net").arg(format!("fd={}", tap_target));
+                    cmd.arg("--net").arg(format!("fd={tap_target}"));
                 }
             } else if net.mode == "bridge" || net.mode == "tap" {
                 if let Some(mac) = &net.mac {
                     cmd.arg("--net")
                         .arg(format!("tap={},mac={}", net.interface_name, mac));
                 } else {
-                    cmd.arg("--net")
-                        .arg(format!("tap={}", net.interface_name));
+                    cmd.arg("--net").arg(format!("tap={}", net.interface_name));
                 }
             }
         }
 
         unsafe {
             cmd.pre_exec(move || {
+                libc::umask(0o077);
                 for &(src_fd, target_fd) in &fd_mappings {
-                    if src_fd >= 0 && src_fd != target_fd {
-                        if libc::dup2(src_fd, target_fd) < 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
+                    if src_fd >= 0 && src_fd != target_fd && libc::dup2(src_fd, target_fd) < 0 {
+                        return Err(std::io::Error::last_os_error());
                     }
                     let flags = libc::fcntl(target_fd, libc::F_GETFD);
                     if flags >= 0 {
@@ -220,59 +164,61 @@ impl HypervisorBackend for CloudHypervisorBackend {
         }
 
         println!("Starting Cloud-Hypervisor VM '{}'...", config.name);
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("Failed to spawn Cloud-Hypervisor '{}'", bin_path.display()))?;
+        let mut child = cmd.spawn().with_context(|| {
+            format!("Failed to spawn Cloud-Hypervisor '{}'", bin_path.display())
+        })?;
+        ignore_sigint();
+        if let Ok(mode) = global.socket_mode_bits() {
+            if let Ok(paths) = control::socket_paths(global, config) {
+                control::tighten_sockets(paths, mode);
+            }
+        }
 
         let status = child.wait().context("Cloud-Hypervisor process failed")?;
         if !status.success() {
-            eprintln!("Cloud-Hypervisor process exited with: {:?}", status);
+            return Err(anyhow!("Cloud-Hypervisor exited with {status}"));
         }
-
         Ok(())
     }
 
-    fn stop(&self, config: &VmConfig) -> Result<()> {
-        let sock_path = format!("/run/mvmctl/{}-api.sock", config.name);
-        if !Path::new(&sock_path).exists() {
-            println!("API socket '{}' not found, VM might already be stopped.", sock_path);
+    fn stop(&self, config: &VmConfig, global: &GlobalConfig) -> Result<()> {
+        let sock = global.control_socket(&config.backend, &config.name);
+        if !sock.exists() {
+            println!(
+                "API socket '{}' not found, VM might already be stopped.",
+                sock.display()
+            );
             return Ok(());
         }
 
-        println!("Sending ACPI power-button to Cloud-Hypervisor VM '{}'...", config.name);
-        let mut stream = UnixStream::connect(&sock_path)
-            .with_context(|| format!("Failed to connect to API socket '{}'", sock_path))?;
-        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(3)))?;
-
-        // HTTP PUT /api/v1/vm.power-button
-        let req = "PUT /api/v1/vm.power-button HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n";
-        stream.write_all(req.as_bytes())?;
-        stream.flush()?;
-
-        let mut reader = BufReader::new(stream);
-        let mut status_line = String::new();
-        let _ = reader.read_line(&mut status_line);
-
-        for _ in 0..45 {
-            if !Path::new(&sock_path).exists() {
-                println!("VM '{}' stopped successfully.", config.name);
-                return Ok(());
-            }
-            thread::sleep(Duration::from_secs(1));
+        println!(
+            "Sending ACPI power-button to Cloud-Hypervisor VM '{}'...",
+            config.name
+        );
+        let (code, body) = ch_request(&sock, "PUT", "/api/v1/vm.power-button")?;
+        if !(200..300).contains(&code) {
+            return Err(anyhow!(
+                "cloud-hypervisor power-button returned HTTP {code}: {body}"
+            ));
         }
 
-        println!("Warning: VM '{}' did not terminate within 45 seconds.", config.name);
-        Ok(())
+        let timeout = Duration::from_secs(global.stop_timeout_secs);
+        if control::wait_for_removal(&sock, timeout) {
+            println!("VM '{}' stopped successfully.", config.name);
+            return Ok(());
+        }
+        Err(anyhow!(
+            "VM '{}' did not terminate within {} seconds",
+            config.name,
+            global.stop_timeout_secs
+        ))
     }
 
-    fn clean(&self, config: &VmConfig) -> Result<()> {
-        println!("Cleaning up network interfaces and sockets for VM '{}'...", config.name);
-        NetworkManager::cleanup_networks(&config.name, &config.backend)?;
-        let api_sock = format!("/run/mvmctl/{}-api.sock", config.name);
-        let ser_sock = format!("/run/mvmctl/{}-serial.sock", config.name);
-        let _ = fs::remove_file(api_sock);
-        let _ = fs::remove_file(ser_sock);
-        Ok(())
+    fn clean(&self, config: &VmConfig, global: &GlobalConfig) -> Result<()> {
+        println!(
+            "Cleaning up network interfaces and sockets for VM '{}'...",
+            config.name
+        );
+        NetworkManager::cleanup(global, config)
     }
 }

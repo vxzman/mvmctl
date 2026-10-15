@@ -1,6 +1,6 @@
 [package]
 name = "mvmctl"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "MicroVM controller and systemd generator for QEMU and Cloud-Hypervisor"
 license = "MIT"
