@@ -49,8 +49,8 @@
 ## 🚀 核心功能特性
 
 - **双后端无缝兼容**：
-  - **QEMU**：支持 UEFI 固件启动（OVMF Code + Vars）、直接内核引导、SPICE 远程桌面、QMP 套接字优雅 ACPI 关机。
-  - **Cloud-Hypervisor**：支持极速直接内核引导（vmlinuz + initrd + cmdline）、O_DIRECT 高吞吐存储、REST API 套接字优雅 ACPI 关机。
+  - **QEMU**：支持 UEFI 固件启动（OVMF Code + Vars）、直接内核引导（`vmlinuz` / 带 PVH 的 `vmlinux`，initrd 可选）、SPICE 远程桌面、QMP 套接字优雅 ACPI 关机。
+  - **Cloud-Hypervisor**：支持直接内核引导（带 PVH 的 `vmlinux` 或 `bzImage`，initrd 可选）、O_DIRECT 高吞吐存储、REST API 套接字优雅 ACPI 关机。
 - **网络原生编排**：
   - 支持 **`macvtap`** 与 **`bridge` / `tap`** 模式。macvtap、主网卡和 up/down 走 netlink；tap 设备用 `/dev/net/tun` 的 `TUNSETIFF` 创建，不调用 `ip`。
   - 自动管理接口命名规范（`qu-<name>` / `ch-<name>`），单/多网卡索引自动分配。
@@ -147,14 +147,16 @@ sudo make install
 | `extra_args` | array | `[]` | 透传给底层 Hypervisor 的原生附加参数 |
 
 #### 1. `boot` 引导配置
-- `mode`: `"direct"`（直接内核引导）或 `"uefi"`（UEFI 固件引导，默认）。
-- **直接内核引导选项**：
-  - `kernel`: 内核镜像绝对路径（例如 `/hypervisor/vm-rhel/boot/vmlinuz`）。
-  - `initrd`: Initramfs 镜像绝对路径（可选）。
-  - `cmdline`: 内核启动命令行参数（例如 `"console=ttyS0 root=/dev/vda rw rootwait"`）。
-- **UEFI 固件引导选项**：
+- `mode`: `"direct"`（直接内核引导）或 `"uefi"`（UEFI 固件引导，默认）。两种后端用同一组字段。
+- **直接内核引导选项**（仅 `"mode": "direct"` 时生效）：
+  - `kernel`: 内核镜像绝对路径。必填。
+  - `initrd`: Initramfs 镜像绝对路径。可选。
+  - `cmdline`: 内核启动命令行。QEMU 未写则不传 `-append`。cloud-hypervisor 未写则用全局配置里的 `cloud_hypervisor.default_cmdline`。
+- **UEFI 固件引导选项**（`"mode": "uefi"` 时忽略 `kernel`、`initrd`、`cmdline`）：
   - `uefi_code`: OVMF 代码固件路径（默认 `/usr/share/OVMF/OVMF_CODE_4M.ms.fd`）。
   - `uefi_vars`: NVRAM 变量文件路径（默认 `/var/lib/qemu/nvram/<name>_VARS.fd`）。
+
+QEMU 把这三项传成 `-kernel`、`-initrd`、`-append`。cloud-hypervisor 传成 `--kernel`、`--initramfs`、`--cmdline`。按场景怎么选，见下面的「直接内核引导」。
 
 #### 2. `disks` 磁盘配置
 - `path`: 磁盘块设备或镜像文件路径（如 `/dev/ubuntu-vg/rhel.raw` 或 `/path/to/disk.qcow2`）。
@@ -179,9 +181,55 @@ sudo make install
 
 ---
 
+## 💡 直接内核引导
+
+`"mode": "direct"` 时两种后端都读 `kernel`、`initrd`、`cmdline`。能不能省掉 initrd，看这个内核自己能不能挂上根磁盘，和镜像是不是解压后的 `vmlinux` 无关。
+
+### 场景 1：发行版内核，带 initrd
+
+发行版内核通常把 virtio 和文件系统做成模块，模块在 `initrd.img` 里。`vmlinuz` 或 `bzImage` 都要带上 initrd，并在 `cmdline` 里写 `root=`。QEMU 和 cloud-hypervisor 用同一段 `boot`。
+
+```json
+"boot": {
+  "mode": "direct",
+  "kernel": "/hypervisor/vm-rhel/boot/vmlinuz",
+  "initrd": "/hypervisor/vm-rhel/boot/initrd.img",
+  "cmdline": "console=ttyS0 root=/dev/vda rw rootwait"
+}
+```
+
+把发行版的 `vmlinuz` 解压成 `vmlinux` 也不会把这些模块收进内核，仍然需要 initrd。
+
+### 场景 2：驱动编进内核，不带 initrd
+
+磁盘驱动和根文件系统编进内核（例如 `CONFIG_VIRTIO_BLK=y` 和 `CONFIG_EXT4_FS=y`），命令行里有 `root=/dev/vda` 这类路径时，可以不写 `initrd`。Cloud Hypervisor 自带的那类内核就是这样启动的。
+
+```json
+"boot": {
+  "mode": "direct",
+  "kernel": "/hypervisor/vm-app/boot/vmlinux",
+  "cmdline": "console=ttyS0 root=/dev/vda rw rootwait"
+}
+```
+
+`backend` 写成 `"qemu"` 或 `"cloud-hypervisor"` 都可以。QEMU 没写 `cmdline` 时不会加默认参数；cloud-hypervisor 会用 `cloud_hypervisor.default_cmdline`。
+
+### 场景 3：内核文件用哪种
+
+| 后端 | 可以直接加载 | 解压后的 `vmlinux` |
+| :--- | :--- | :--- |
+| QEMU | 普通 `vmlinuz` / `bzImage` | 必须带 PVH ELF note（内核配置 `CONFIG_PVH=y`）。否则 QEMU 报 `Error loading uncompressed kernel without PVH ELF Note` |
+| cloud-hypervisor（x86-64） | `bzImage`，或带 PVH 的 `vmlinux` | 同样需要 PVH。官方构建产物常见路径是 `arch/x86/boot/compressed/vmlinux.bin` |
+
+### 场景 4：UEFI 固件
+
+`"mode": "uefi"` 时不读 `kernel`、`initrd`、`cmdline`。QEMU 挂 OVMF code 和 vars。cloud-hypervisor 使用 `boot.uefi_code`，没有则用全局配置里的 `cloud_hypervisor.uefi_firmware`。完整例子见下面的 FreeBSD。
+
 ## 💡 生产配置实战示例
 
 ### 示例 1：Cloud-Hypervisor 直接内核启动 (`/etc/mvmctl/rhel.json`)
+
+对应场景 1。把 `backend` 改成 `"qemu"` 后，同一段 `boot` 会传给 QEMU 的 `-kernel`、`-initrd`、`-append`。
 ```json
 {
   "name": "rhel",
@@ -218,6 +266,8 @@ sudo make install
 ```
 
 ### 示例 2：QEMU UEFI 固件 + SPICE 远程桌面 (`/etc/mvmctl/freebsd.json`)
+
+对应场景 4。这里的 `boot` 只提供固件，不提供内核。
 ```json
 {
   "name": "freebsd",
