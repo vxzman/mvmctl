@@ -275,7 +275,10 @@ pub fn watch_qemu_shutdown(sock: PathBuf, slot: Arc<Mutex<Option<String>>>, stop
     };
     let mut pending = Vec::new();
     if let Err(err) = qmp_handshake(&mut stream, &mut pending, &slot) {
-        eprintln!("QMP watcher for '{}' stopped: {err}", sock.display());
+        crate::log::warn(format!(
+            "QMP watcher for '{}' stopped: {err}",
+            sock.display()
+        ));
         return;
     }
     loop {

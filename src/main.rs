@@ -8,6 +8,7 @@ mod config;
 mod console;
 mod control;
 mod generator;
+mod log;
 mod mac;
 mod netlink;
 mod network;

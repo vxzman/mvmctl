@@ -1,16 +1,15 @@
 use anyhow::{anyhow, Context, Result};
-use std::io::{BufRead, BufReader};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
 use crate::backend::{ensure_runtime_dir, ignore_sigint, lock_writable_disks, HypervisorBackend};
 use crate::config::{BootMode, VmConfig};
 use crate::control::{self, ch_request};
+use crate::log;
 use crate::network::NetworkManager;
 use crate::settings::{self, firmware_path, GlobalConfig, SerialTarget};
 
@@ -49,7 +48,7 @@ fn supervise_ch(
 ) -> Result<()> {
     let mut restarts = Vec::new();
     loop {
-        println!("Starting Cloud-Hypervisor VM '{}'...", config.name);
+        log::info(format!("starting cloud-hypervisor VM '{}'", config.name));
         let mut child = cmd.spawn().with_context(|| {
             format!("Failed to spawn Cloud-Hypervisor '{}'", bin_path.display())
         })?;
@@ -61,10 +60,13 @@ fn supervise_ch(
         }
 
         let signal = Arc::new(Mutex::new(None));
-        let stderr = child.stderr.take();
-        let reader = thread::spawn({
+        let reader = log::spawn_stderr_pump(child.stderr.take(), "cloud-hypervisor", {
             let signal = Arc::clone(&signal);
-            move || forward_ch_stderr(stderr, signal)
+            move |line| {
+                if let Some(kind) = control::ch_lifecycle_signal(line) {
+                    *signal.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(kind);
+                }
+            }
         });
         let status = child.wait().context("Cloud-Hypervisor process failed")?;
         let _ = reader.join();
@@ -78,43 +80,12 @@ fn supervise_ch(
             control::VmExit::Restart => {
                 control::note_restart(&mut restarts)
                     .with_context(|| format!("VM '{}' reset too often", config.name))?;
-                eprintln!(
-                    "Cloud-Hypervisor exited during guest reset; restarting VM '{}'",
+                log::info(format!(
+                    "cloud-hypervisor exited during guest reset; restarting VM '{}'",
                     config.name
-                );
+                ));
                 control::unlink_runtime_sockets(global, config);
             }
-        }
-    }
-}
-
-fn forward_ch_stderr(
-    stderr: Option<std::process::ChildStderr>,
-    signal: Arc<Mutex<Option<control::ChLifecycle>>>,
-) {
-    let Some(stderr) = stderr else {
-        return;
-    };
-    let mut reader = BufReader::new(stderr);
-    let mut buf = Vec::new();
-    loop {
-        buf.clear();
-        match reader.read_until(b'\n', &mut buf) {
-            Ok(0) => return,
-            Ok(_) => {
-                if buf.last() == Some(&b'\n') {
-                    buf.pop();
-                }
-                if buf.last() == Some(&b'\r') {
-                    buf.pop();
-                }
-                let line = String::from_utf8_lossy(&buf);
-                if let Some(kind) = control::ch_lifecycle_signal(&line) {
-                    *signal.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(kind);
-                }
-                eprintln!("{line}");
-            }
-            Err(_) => return,
         }
     }
 }
@@ -123,18 +94,22 @@ fn forward_ch_stderr(
 fn force_ch_poweroff(sock: &Path, name: &str) -> Result<()> {
     if sock.exists() {
         if let Err(err) = ch_request(sock, "PUT", "/api/v1/vm.shutdown") {
-            eprintln!("cloud-hypervisor vm.shutdown failed for VM '{name}': {err:#}");
+            log::warn(format!(
+                "cloud-hypervisor vm.shutdown failed for VM '{name}': {err:#}"
+            ));
         }
     }
     if !sock.exists() {
-        println!("VM '{name}' powered off.");
+        log::info(format!("VM '{name}' powered off"));
         return Ok(());
     }
     if let Err(err) = ch_request(sock, "PUT", "/api/v1/vmm.shutdown") {
-        eprintln!("cloud-hypervisor vmm.shutdown failed for VM '{name}': {err:#}");
+        log::warn(format!(
+            "cloud-hypervisor vmm.shutdown failed for VM '{name}': {err:#}"
+        ));
     }
     if control::wait_for_removal(sock, Duration::from_secs(5)) {
-        println!("VM '{name}' powered off.");
+        log::info(format!("VM '{name}' powered off"));
         return Ok(());
     }
     Err(anyhow!(
@@ -277,49 +252,49 @@ impl HypervisorBackend for CloudHypervisorBackend {
     fn stop(&self, config: &VmConfig, global: &GlobalConfig) -> Result<()> {
         let sock = global.control_socket(&config.backend, &config.name);
         if !sock.exists() {
-            println!(
-                "API socket '{}' not found, VM might already be stopped.",
+            log::info(format!(
+                "API socket '{}' not found, VM might already be stopped",
                 sock.display()
-            );
+            ));
             return Ok(());
         }
 
-        println!(
-            "Sending ACPI power-button to Cloud-Hypervisor VM '{}'...",
+        log::info(format!(
+            "sending ACPI power-button to cloud-hypervisor VM '{}'",
             config.name
-        );
+        ));
         match ch_request(&sock, "PUT", "/api/v1/vm.power-button") {
             Ok((code, _)) if (200..300).contains(&code) => {
                 let timeout = Duration::from_secs(global.stop_timeout_secs);
                 if control::wait_for_removal(&sock, timeout) {
-                    println!("VM '{}' stopped successfully.", config.name);
+                    log::info(format!("VM '{}' stopped", config.name));
                     return Ok(());
                 }
-                eprintln!(
+                log::warn(format!(
                     "VM '{}' did not stop within {} seconds; forcing power-off",
                     config.name, global.stop_timeout_secs
-                );
+                ));
             }
             Ok((code, body)) => {
-                eprintln!(
+                log::warn(format!(
                     "cloud-hypervisor power-button returned HTTP {code}: {body}; forcing power-off"
-                );
+                ));
             }
             Err(err) => {
-                eprintln!(
+                log::warn(format!(
                     "ACPI power-button failed for VM '{}': {err:#}; forcing power-off",
                     config.name
-                );
+                ));
             }
         }
         force_ch_poweroff(&sock, &config.name)
     }
 
     fn clean(&self, config: &VmConfig, global: &GlobalConfig) -> Result<()> {
-        println!(
-            "Cleaning up network interfaces and sockets for VM '{}'...",
+        log::info(format!(
+            "cleaning network interfaces and sockets for VM '{}'",
             config.name
-        );
+        ));
         NetworkManager::cleanup(global, config)
     }
 }

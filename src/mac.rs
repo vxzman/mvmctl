@@ -86,11 +86,11 @@ pub fn persist_missing_macs(global: &GlobalConfig, also: Option<&Path>) -> Resul
         for (nic, net) in filled.networks.iter().enumerate() {
             if mac_is_unset(&item.config.networks[nic].mac) {
                 if let Some(mac) = &net.mac {
-                    println!(
-                        "Assigned MAC {mac} to VM '{}' network {nic} ({})",
+                    crate::log::info(format!(
+                        "assigned MAC {mac} to VM '{}' network {nic} ({})",
                         filled.name,
                         item.path.display()
-                    );
+                    ));
                 }
             }
         }

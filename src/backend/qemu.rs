@@ -3,7 +3,7 @@ use std::fs;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -12,6 +12,7 @@ use std::time::Duration;
 use crate::backend::{ensure_runtime_dir, ignore_sigint, lock_writable_disks, HypervisorBackend};
 use crate::config::{BootMode, VmConfig};
 use crate::control::{self, qmp_execute};
+use crate::log;
 use crate::network::NetworkManager;
 use crate::settings::{self, GlobalConfig, SerialTarget};
 
@@ -81,7 +82,7 @@ fn supervise_qemu(
 ) -> Result<()> {
     let mut restarts = Vec::new();
     loop {
-        println!("Starting QEMU VM '{}'...", config.name);
+        log::info(format!("starting QEMU VM '{}'", config.name));
         let mut child = cmd
             .spawn()
             .with_context(|| format!("Failed to spawn QEMU process '{}'", bin_path.display()))?;
@@ -101,11 +102,13 @@ fn supervise_qemu(
             let stop = Arc::clone(&stop);
             move || control::watch_qemu_shutdown(sock, slot, stop)
         });
+        let logs = log::spawn_stderr_pump(child.stderr.take(), "qemu", |_| {});
         let status = child
             .wait()
             .context("QEMU process failed during execution")?;
         stop.store(true, Ordering::Relaxed);
         let _ = watcher.join();
+        let _ = logs.join();
         let reason = slot
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -123,10 +126,10 @@ fn supervise_qemu(
             control::VmExit::Restart => {
                 control::note_restart(&mut restarts)
                     .with_context(|| format!("VM '{}' reset too often", config.name))?;
-                eprintln!(
+                log::info(format!(
                     "QEMU exited for a guest reset; restarting VM '{}'",
                     config.name
-                );
+                ));
                 control::unlink_runtime_sockets(global, config);
             }
         }
@@ -136,11 +139,11 @@ fn supervise_qemu(
 fn force_qemu_poweroff(sock: &Path, name: &str) -> Result<()> {
     if sock.exists() {
         if let Err(err) = qmp_execute(sock, "quit") {
-            eprintln!("QMP quit failed for VM '{name}': {err:#}");
+            log::warn(format!("QMP quit failed for VM '{name}': {err:#}"));
         }
     }
     if control::wait_for_removal(sock, Duration::from_secs(5)) {
-        println!("VM '{name}' powered off.");
+        log::info(format!("VM '{name}' powered off"));
         return Ok(());
     }
     Err(anyhow!(
@@ -341,6 +344,7 @@ impl HypervisorBackend for QemuBackend {
             });
         }
 
+        cmd.stderr(Stdio::piped());
         let result = supervise_qemu(&mut cmd, &bin_path, config, global);
         drop(disk_locks);
         result
@@ -349,44 +353,44 @@ impl HypervisorBackend for QemuBackend {
     fn stop(&self, config: &VmConfig, global: &GlobalConfig) -> Result<()> {
         let sock = global.control_socket(&config.backend, &config.name);
         if !sock.exists() {
-            println!(
-                "QMP socket '{}' not found, VM might already be stopped.",
+            log::info(format!(
+                "QMP socket '{}' not found, VM might already be stopped",
                 sock.display()
-            );
+            ));
             return Ok(());
         }
 
-        println!(
-            "Sending ACPI powerdown to QEMU VM '{}' via QMP...",
+        log::info(format!(
+            "sending ACPI powerdown to QEMU VM '{}' via QMP",
             config.name
-        );
+        ));
         match qmp_execute(&sock, "system_powerdown") {
             Ok(_) => {
                 let timeout = Duration::from_secs(global.stop_timeout_secs);
                 if control::wait_for_removal(&sock, timeout) {
-                    println!("VM '{}' stopped successfully.", config.name);
+                    log::info(format!("VM '{}' stopped", config.name));
                     return Ok(());
                 }
-                eprintln!(
+                log::warn(format!(
                     "VM '{}' did not stop within {} seconds; forcing power-off",
                     config.name, global.stop_timeout_secs
-                );
+                ));
             }
             Err(err) => {
-                eprintln!(
+                log::warn(format!(
                     "ACPI powerdown failed for VM '{}': {err:#}; forcing power-off",
                     config.name
-                );
+                ));
             }
         }
         force_qemu_poweroff(&sock, &config.name)
     }
 
     fn clean(&self, config: &VmConfig, global: &GlobalConfig) -> Result<()> {
-        println!(
-            "Cleaning up network interfaces and sockets for VM '{}'...",
+        log::info(format!(
+            "cleaning network interfaces and sockets for VM '{}'",
             config.name
-        );
+        ));
         NetworkManager::cleanup(global, config)
     }
 }
