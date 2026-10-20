@@ -93,7 +93,7 @@ sudo make install
 | 字段 | 默认值 | 说明 |
 | :--- | :--- | :--- |
 | `config_dirs` | `/etc/mvmctl`、`/etc/mvmctl/vms`、`/usr/lib/mvmctl` | 搜索虚拟机 JSON 的目录 |
-| `runtime_dir` | `/run/mvmctl` | QMP、API、串口套接字所在目录，权限由 `runtime_dir_mode` 决定 |
+| `runtime_dir` | `/run/mvmctl` | 控制套接字和串口套接字所在目录，权限由 `runtime_dir_mode` 决定。QEMU 使用 `<name>-qmp.sock`（`list` / `stop`）和 `<name>-qmp-events.sock`（关机事件）。cloud-hypervisor 使用 `<name>-api.sock` |
 | `state_dir` | `/var/lib/mvmctl` | 解析后的执行计划 |
 | `log_dir` | `/var/log/mvmctl` | `serial.mode=file` 且未写路径时的日志目录 |
 | `mvmctl_bin` | `/usr/local/bin/mvmctl` | 写入单元 `ExecStart` 的二进制；路径不存在时改用当前正在运行的程序 |

@@ -175,7 +175,7 @@ pub fn tighten_sockets(paths: Vec<PathBuf>, mode: u32) {
 }
 
 pub fn socket_paths(global: &GlobalConfig, cfg: &VmConfig) -> Result<Vec<PathBuf>> {
-    let mut paths = vec![global.control_socket(&cfg.backend, &cfg.name)];
+    let mut paths = global.runtime_ipc_sockets(&cfg.backend, &cfg.name);
     if let settings::SerialTarget::Socket(path) = settings::resolve_serial(global, cfg)? {
         paths.push(path);
     }

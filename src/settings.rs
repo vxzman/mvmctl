@@ -341,6 +341,20 @@ impl GlobalConfig {
         self.runtime_dir.join(format!("{name}-{suffix}.sock"))
     }
 
+    /// Second QMP listener so the shutdown watcher does not occupy the socket
+    /// that `list` and `stop` use. QEMU unix sockets accept one client at a time.
+    pub fn qmp_event_socket(&self, name: &str) -> PathBuf {
+        self.runtime_dir.join(format!("{name}-qmp-events.sock"))
+    }
+
+    pub fn runtime_ipc_sockets(&self, backend: &BackendType, name: &str) -> Vec<PathBuf> {
+        let mut paths = vec![self.control_socket(backend, name)];
+        if *backend == BackendType::Qemu {
+            paths.push(self.qmp_event_socket(name));
+        }
+        paths
+    }
+
     pub fn default_serial_socket(&self, name: &str) -> PathBuf {
         self.runtime_dir.join(format!("{name}-serial.sock"))
     }

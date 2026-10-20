@@ -216,7 +216,7 @@ impl ResourceRegistry {
             }
 
             // (d) Socket path conflict check
-            let mut sockets_to_check = vec![global.control_socket(&cfg.backend, &cfg.name)];
+            let mut sockets_to_check = global.runtime_ipc_sockets(&cfg.backend, &cfg.name);
             match settings::resolve_serial(global, cfg) {
                 Ok(SerialTarget::Socket(path)) => sockets_to_check.push(path),
                 Ok(_) => {}

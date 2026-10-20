@@ -94,9 +94,9 @@ fn supervise_qemu(
 
         let slot = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
-        let qmp_sock = global.control_socket(&config.backend, &config.name);
+        let event_sock = global.qmp_event_socket(&config.name);
         let watcher = thread::spawn({
-            let sock = qmp_sock.clone();
+            let sock = event_sock.clone();
             let slot = Arc::clone(&slot);
             let stop = Arc::clone(&stop);
             move || control::watch_qemu_shutdown(sock, slot, stop)
@@ -170,8 +170,11 @@ impl HypervisorBackend for QemuBackend {
         cmd.arg("-device").arg("virtio-balloon-pci");
 
         let qmp_sock = global.control_socket(&config.backend, &config.name);
+        let qmp_events = global.qmp_event_socket(&config.name);
         cmd.arg("-qmp")
             .arg(format!("unix:{},server,nowait", qmp_sock.display()));
+        cmd.arg("-qmp")
+            .arg(format!("unix:{},server,nowait", qmp_events.display()));
         cmd.arg("-display").arg("none");
 
         match settings::resolve_serial(global, config)? {

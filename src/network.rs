@@ -149,8 +149,9 @@ impl NetworkManager {
         let names = settings::interface_names(global, config)?;
         delete_interfaces(&names);
 
-        let control = global.control_socket(&config.backend, &config.name);
-        let _ = fs::remove_file(control);
+        for path in global.runtime_ipc_sockets(&config.backend, &config.name) {
+            let _ = fs::remove_file(path);
+        }
         if let settings::SerialTarget::Socket(path) = settings::resolve_serial(global, config)? {
             let _ = fs::remove_file(path);
         }
