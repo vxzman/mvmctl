@@ -135,6 +135,13 @@ impl NetworkManager {
             }
             return Err(err);
         }
+        if let Err(err) = netlink::disable_tap_tx_offload(ifname) {
+            if created {
+                delete_interfaces([ifname]);
+            }
+            return Err(err);
+        }
+        crate::log::info(format!("disabled TX checksum offload on {ifname}"));
         Ok(())
     }
 

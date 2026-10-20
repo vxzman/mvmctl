@@ -23,6 +23,17 @@ const IFLA_INFO_DATA: u16 = 2;
 const IFLA_MACVLAN_MODE: u16 = 1;
 const MACVLAN_MODE_BRIDGE: u32 = 4;
 const IF_FLAG_UP: u32 = 1;
+const SIOCETHTOOL: libc::Ioctl = 0x8946 as libc::Ioctl;
+const ETHTOOL_STXCSUM: u32 = 0x17;
+const ETHTOOL_STSO: u32 = 0x1f;
+const ETHTOOL_SGSO: u32 = 0x24;
+const ETHTOOL_SGRO: u32 = 0x2c;
+
+#[repr(C)]
+struct EthtoolValue {
+    cmd: u32,
+    data: u32,
+}
 
 static NL_SEQ: AtomicU32 = AtomicU32::new(1);
 
@@ -159,15 +170,7 @@ pub fn create_tap(ifname: &str) -> Result<()> {
     let _owned = OwnedFd(fd);
     // SAFETY: ifreq is a plain C struct. Zeroed is the empty name the ioctl expects.
     let mut req: libc::ifreq = unsafe { mem::zeroed() };
-    let bytes = ifname.as_bytes();
-    if bytes.len() >= libc::IFNAMSIZ {
-        return Err(anyhow!(
-            "Interface name '{ifname}' does not fit in IFNAMSIZ"
-        ));
-    }
-    for (idx, byte) in bytes.iter().enumerate() {
-        req.ifr_name[idx] = *byte as c_char;
-    }
+    fill_ifr_name(&mut req, ifname)?;
     req.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short;
     // SAFETY: TUNSETIFF reads the ifreq for the lifetime of the call. fd is open.
     let rc = unsafe { libc::ioctl(fd, libc::TUNSETIFF, &mut req) };
@@ -193,6 +196,52 @@ pub fn set_master(ifname: &str, master: &str) -> Result<()> {
 pub fn set_up(ifname: &str) -> Result<()> {
     let msg = link_modify(ifindex(ifname)?, None, true, next_seq());
     talk(&msg).with_context(|| format!("Failed to bring up interface '{ifname}'"))
+}
+
+/// Same as `ethtool -K <tap> tx off`. TAP TX checksum offload leaves UDP
+/// checksums incomplete (CHECKSUM_PARTIAL); the guest then drops replies
+/// from host services on the bridge. TSO/GSO follow TX checksum; GRO is
+/// independent and is turned off to match the working host TAP.
+pub fn disable_tap_tx_offload(ifname: &str) -> Result<()> {
+    ethtool_set_u32(ifname, ETHTOOL_STXCSUM, 0)
+        .with_context(|| format!("Failed to disable TX checksum offload on '{ifname}'"))?;
+    let _ = ethtool_set_u32(ifname, ETHTOOL_STSO, 0);
+    let _ = ethtool_set_u32(ifname, ETHTOOL_SGSO, 0);
+    let _ = ethtool_set_u32(ifname, ETHTOOL_SGRO, 0);
+    Ok(())
+}
+
+fn ethtool_set_u32(ifname: &str, cmd: u32, data: u32) -> Result<()> {
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("Failed to open an ethtool socket");
+    }
+    let _owned = OwnedFd(fd);
+    let mut eval = EthtoolValue { cmd, data };
+    // SAFETY: ifreq is a plain C struct. Zeroed name is filled next.
+    let mut req: libc::ifreq = unsafe { mem::zeroed() };
+    fill_ifr_name(&mut req, ifname)?;
+    req.ifr_ifru.ifru_data = (&mut eval as *mut EthtoolValue).cast();
+    // SAFETY: fd is a live socket; ifr_data points at eval for this call.
+    let rc = unsafe { libc::ioctl(fd, SIOCETHTOOL, &mut req) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("Failed to set ethtool command 0x{cmd:x} on '{ifname}'"));
+    }
+    Ok(())
+}
+
+fn fill_ifr_name(req: &mut libc::ifreq, ifname: &str) -> Result<()> {
+    let bytes = ifname.as_bytes();
+    if bytes.len() >= libc::IFNAMSIZ {
+        return Err(anyhow!(
+            "Interface name '{ifname}' does not fit in IFNAMSIZ"
+        ));
+    }
+    for (idx, byte) in bytes.iter().enumerate() {
+        req.ifr_name[idx] = *byte as c_char;
+    }
+    Ok(())
 }
 
 pub fn delete_link(ifname: &str) -> Result<()> {
@@ -418,5 +467,31 @@ mod tests {
 
         ack[16..20].copy_from_slice(&0i32.to_ne_bytes());
         assert!(parse_ack(&ack).unwrap().unwrap().is_ok());
+    }
+
+    #[test]
+    fn ethtool_value_is_cmd_then_data() {
+        assert_eq!(std::mem::size_of::<EthtoolValue>(), 8);
+        let value = EthtoolValue {
+            cmd: ETHTOOL_STXCSUM,
+            data: 0,
+        };
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&value as *const EthtoolValue).cast::<u8>(),
+                std::mem::size_of::<EthtoolValue>(),
+            )
+        };
+        assert_eq!(&bytes[..4], &ETHTOOL_STXCSUM.to_ne_bytes());
+        assert_eq!(&bytes[4..], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn fill_ifr_name_rejects_overlong() {
+        let mut req: libc::ifreq = unsafe { mem::zeroed() };
+        assert!(fill_ifr_name(&mut req, "this-name-is-too-long").is_err());
+        fill_ifr_name(&mut req, "ch-rhel").unwrap();
+        let name = unsafe { std::ffi::CStr::from_ptr(req.ifr_name.as_ptr()) };
+        assert_eq!(name.to_str().unwrap(), "ch-rhel");
     }
 }
