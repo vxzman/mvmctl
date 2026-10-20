@@ -10,6 +10,12 @@ use crate::settings::{self, GlobalConfig};
 
 pub struct SystemdGenerator;
 
+/// systemd unit name for a VM. Dots in the unit name are valid; the type is
+/// still `.service`, so `rhel` becomes `rhel.vm.service`.
+pub fn service_unit_name(vm_name: &str) -> String {
+    format!("{vm_name}.vm.service")
+}
+
 impl SystemdGenerator {
     pub fn generate_unit(global: &GlobalConfig, config: &VmConfig, config_path: &Path) -> String {
         let abs_path =
@@ -72,7 +78,7 @@ Wants={wants_line}
 {requires_line}{mounts_line}
 [Service]
 Type=simple
-{runtime_lines}SyslogIdentifier=vm-{name}
+{runtime_lines}SyslogIdentifier={name}.vm
 ExecStart="{bin}" run "{src}"
 ExecStop="{bin}" stop "{src}"
 ExecStopPost=-"{bin}" clean "{src}"
@@ -130,7 +136,7 @@ WantedBy=multi-user.target
             let plan = ResolvedPlan::compile(global, config)?;
             let _ = plan.save_resolved(global);
 
-            let unit_name = format!("vm-{}.service", config.name);
+            let unit_name = service_unit_name(&config.name);
             let unit_path = output_dir.join(&unit_name);
             let unit_content = Self::generate_unit(global, config, path);
 
@@ -160,7 +166,7 @@ WantedBy=multi-user.target
     ) -> Result<PathBuf> {
         fs::create_dir_all(dest_dir)
             .with_context(|| format!("Failed to create destination dir {}", dest_dir.display()))?;
-        let unit_name = format!("vm-{}.service", config.name);
+        let unit_name = service_unit_name(&config.name);
         let dest_file = dest_dir.join(&unit_name);
         let content = Self::generate_unit(global, config, config_path);
         fs::write(&dest_file, content)
@@ -196,9 +202,16 @@ mod tests {
         assert!(unit.contains(r"Requires=dev-ubuntu\x2dvg-freebsd.disk.device"));
         assert!(unit.contains("RequiresMountsFor=/var/lib/images/extra.qcow2"));
         assert!(unit.contains("TimeoutStopSec=40"));
+        assert!(unit.contains("SyslogIdentifier=freebsd.vm"));
         assert!(unit.contains("Description=line1 ExecStart=/bin/evil %%h"));
         assert!(!unit
             .lines()
             .any(|line| line.starts_with("ExecStart=/bin/evil")));
+    }
+
+    #[test]
+    fn service_unit_name_uses_vm_suffix() {
+        assert_eq!(service_unit_name("rhel"), "rhel.vm.service");
+        assert_eq!(service_unit_name("freebsd"), "freebsd.vm.service");
     }
 }

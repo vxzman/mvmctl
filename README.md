@@ -13,7 +13,7 @@
 
 **`mvmctl` 汲取了 Podman Quadlet 的核心架构设计**：
 - **声明式配置**：通过直观的 JSON 文件（如 `/etc/mvmctl/rhel.json`、`/etc/mvmctl/freebsd.json`）定义虚拟机的全部硬件与拓扑属性。
-- **原生生成器集成**：遵循 systemd generator 规范。每次执行 `systemctl daemon-reload` 时，生成器会自动扫描配置文件并即时编译出独立的 `vm-<name>.service`。
+- **原生生成器集成**：遵循 systemd generator 规范。每次执行 `systemctl daemon-reload` 时，生成器会自动扫描配置文件并即时编译出独立的 `<name>.vm.service`。
 - **双后端统一调度**：一套统一的配置接口，同时兼容 **QEMU** 与 **Cloud-Hypervisor**。
 - **纯 Rust 安全透传**：在 Rust 子进程派生前（`pre_exec` 阶段）直接完成 macvtap 与 vhost 文件描述符的创建、重定向与继承，优雅安全。
 
@@ -31,13 +31,13 @@
        │
        ▼
 /run/systemd/generator/
-├── vm-rhel.service
-├── vm-freebsd.service
+├── rhel.vm.service
+├── freebsd.vm.service
 └── multi-user.target.wants/
-    ├── vm-rhel.service    (若配置 autostart: true)
-    └── vm-freebsd.service (若配置 autostart: true)
+    ├── rhel.vm.service    (若配置 autostart: true)
+    └── freebsd.vm.service (若配置 autostart: true)
        │
-       ▼  (systemctl start vm-<name>)
+       ▼  (systemctl start <name>.vm)
 /usr/local/bin/mvmctl run /etc/mvmctl/<name>.json
        ├─ 创建并拉起 macvtap / bridge 虚拟网卡
        ├─ 打开 /dev/tap* 与 /dev/vhost-net 继承 FD
@@ -132,7 +132,7 @@ sudo make install
 
 | 字段名 | 类型 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `name` | string | **必填** | 虚拟机名称（决定服务名 `vm-<name>.service`） |
+| `name` | string | **必填** | 虚拟机名称（决定服务名 `<name>.vm.service`） |
 | `description` | string | `null` | 虚拟机描述（展示在 systemd unit 描述中） |
 | `backend` | string | **必填** | 后端类型：`"qemu"` 或 `"cloud-hypervisor"`（可缩写为 `"ch"`） |
 | `hypervisor_path` | string | `null` | 自定义 Hypervisor 二进制绝对路径（不填则自动探测） |
@@ -316,12 +316,12 @@ QEMU 把这三项传成 `-kernel`、`-initrd`、`-append`。cloud-hypervisor 传
 sudo systemctl daemon-reload
 
 # 2. 启停服务
-sudo systemctl start vm-rhel
-sudo systemctl status vm-rhel
-sudo systemctl stop vm-rhel
+sudo systemctl start rhel.vm
+sudo systemctl status rhel.vm
+sudo systemctl stop rhel.vm
 
 # 3. 查看开机自启状态
-systemctl is-enabled vm-rhel
+systemctl is-enabled rhel.vm
 ```
 
 ### 2. 串口控制台直连 (Serial Console)
