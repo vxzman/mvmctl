@@ -25,11 +25,39 @@ use plan::ResolvedPlan;
 use registry::ResourceRegistry;
 use settings::GlobalConfig;
 
+const VERSION_LINE: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("MVMCTL_GIT"),
+    " ",
+    env!("MVMCTL_BUILT_AT"),
+    ")"
+);
+
+const VERSION_LONG: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("MVMCTL_GIT"),
+    ")\n",
+    "built:   ",
+    env!("MVMCTL_BUILT_AT"),
+    "\n",
+    "rustc:   ",
+    env!("MVMCTL_RUSTC"),
+    "\n",
+    "target:  ",
+    env!("MVMCTL_TARGET"),
+    "\n",
+    "profile: ",
+    env!("MVMCTL_PROFILE")
+);
+
 #[derive(Parser)]
 #[command(
     name = "mvmctl",
     author = "Antigravity & kaishuai",
-    version = env!("CARGO_PKG_VERSION"),
+    version = VERSION_LINE,
+    long_version = VERSION_LONG,
     about = "MicroVM controller and systemd Quadlet-style generator with collision detection"
 )]
 struct Cli {
@@ -103,6 +131,9 @@ enum Commands {
         target: String,
     },
 
+    /// Print compile-time version, git commit, and build time
+    Version,
+
     /// Internal systemd generator mode
     #[command(name = "systemd-generator")]
     SystemdGen {
@@ -155,6 +186,7 @@ fn is_systemd_generator_env(args: &[String]) -> bool {
                     | "resources"
                     | "inspect"
                     | "validate"
+                    | "version"
                     | "systemd-generator"
                     | "help"
             )
@@ -276,6 +308,10 @@ fn main() -> Result<()> {
             for warning in settings::path_warnings(&global, &config) {
                 println!("  [!] {warning}");
             }
+        }
+
+        Some(Commands::Version) => {
+            println!("mvmctl {VERSION_LONG}");
         }
 
         Some(Commands::SystemdGen { normal_dir, .. }) => {
@@ -452,4 +488,20 @@ fn list_vms(global: &GlobalConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_strings_include_crate_and_git() {
+        assert!(VERSION_LINE.contains(env!("CARGO_PKG_VERSION")));
+        assert!(VERSION_LINE.contains(env!("MVMCTL_GIT")));
+        assert!(VERSION_LINE.contains(env!("MVMCTL_BUILT_AT")));
+        assert!(VERSION_LONG.contains(env!("MVMCTL_RUSTC")));
+        assert!(VERSION_LONG.contains(env!("MVMCTL_TARGET")));
+        assert_ne!(env!("MVMCTL_GIT"), "");
+        assert_ne!(env!("MVMCTL_BUILT_AT"), "");
+    }
 }

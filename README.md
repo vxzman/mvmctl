@@ -309,6 +309,12 @@ QEMU 把这三项传成 `-kernel`、`-initrd`、`-append`。cloud-hypervisor 传
 
 ## 💻 常用运维操作
 
+查看当前二进制是哪一次编译：
+```bash
+mvmctl --version
+mvmctl version
+```
+
 ### 1. Quadlet 全自动模式（日常推荐）
 将 JSON 配置文件放入 `/etc/mvmctl/` 后，触发 systemd 重载即可：
 ```bash
