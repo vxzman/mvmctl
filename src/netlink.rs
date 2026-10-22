@@ -24,6 +24,7 @@ const IFLA_MACVLAN_MODE: u16 = 1;
 const MACVLAN_MODE_BRIDGE: u32 = 4;
 const IF_FLAG_UP: u32 = 1;
 const SIOCETHTOOL: libc::Ioctl = 0x8946 as libc::Ioctl;
+const ETHTOOL_GTXCSUM: u32 = 0x16;
 const ETHTOOL_STXCSUM: u32 = 0x17;
 const ETHTOOL_STSO: u32 = 0x1f;
 const ETHTOOL_SGSO: u32 = 0x24;
@@ -203,15 +204,19 @@ pub fn set_up(ifname: &str) -> Result<()> {
 /// from host services on the bridge. TSO/GSO follow TX checksum; GRO is
 /// independent and is turned off to match the working host TAP.
 pub fn disable_tap_tx_offload(ifname: &str) -> Result<()> {
-    ethtool_set_u32(ifname, ETHTOOL_STXCSUM, 0)
+    ethtool_value(ifname, ETHTOOL_STXCSUM, 0)
         .with_context(|| format!("Failed to disable TX checksum offload on '{ifname}'"))?;
-    let _ = ethtool_set_u32(ifname, ETHTOOL_STSO, 0);
-    let _ = ethtool_set_u32(ifname, ETHTOOL_SGSO, 0);
-    let _ = ethtool_set_u32(ifname, ETHTOOL_SGRO, 0);
+    let _ = ethtool_value(ifname, ETHTOOL_STSO, 0);
+    let _ = ethtool_value(ifname, ETHTOOL_SGSO, 0);
+    let _ = ethtool_value(ifname, ETHTOOL_SGRO, 0);
     Ok(())
 }
 
-fn ethtool_set_u32(ifname: &str, cmd: u32, data: u32) -> Result<()> {
+pub fn tx_checksum_enabled(ifname: &str) -> Result<bool> {
+    Ok(ethtool_value(ifname, ETHTOOL_GTXCSUM, 0)? != 0)
+}
+
+fn ethtool_value(ifname: &str, cmd: u32, data: u32) -> Result<u32> {
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error()).context("Failed to open an ethtool socket");
@@ -228,7 +233,7 @@ fn ethtool_set_u32(ifname: &str, cmd: u32, data: u32) -> Result<()> {
         return Err(std::io::Error::last_os_error())
             .with_context(|| format!("Failed to set ethtool command 0x{cmd:x} on '{ifname}'"));
     }
-    Ok(())
+    Ok(eval.data)
 }
 
 fn fill_ifr_name(req: &mut libc::ifreq, ifname: &str) -> Result<()> {
@@ -472,6 +477,7 @@ mod tests {
     #[test]
     fn ethtool_value_is_cmd_then_data() {
         assert_eq!(std::mem::size_of::<EthtoolValue>(), 8);
+        assert_eq!(ETHTOOL_GTXCSUM, 0x16);
         let value = EthtoolValue {
             cmd: ETHTOOL_STXCSUM,
             data: 0,

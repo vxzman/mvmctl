@@ -45,6 +45,7 @@ fn supervise_ch(
     bin_path: &Path,
     config: &VmConfig,
     global: &GlobalConfig,
+    tap_names: &[String],
 ) -> Result<()> {
     let mut restarts = Vec::new();
     loop {
@@ -53,6 +54,7 @@ fn supervise_ch(
             format!("Failed to spawn Cloud-Hypervisor '{}'", bin_path.display())
         })?;
         ignore_sigint();
+        NetworkManager::ensure_tap_tx_offload_off(tap_names);
         if let Ok(mode) = global.socket_mode_bits() {
             if let Ok(paths) = control::socket_paths(global, config) {
                 control::tighten_sockets(paths, mode);
@@ -212,16 +214,25 @@ impl HypervisorBackend for CloudHypervisorBackend {
                 fd_mappings.push((tap_raw, tap_target));
 
                 if let Some(mac) = &net.mac {
-                    cmd.arg("--net").arg(format!("fd={tap_target},mac={mac}"));
+                    cmd.arg("--net").arg(format!(
+                        "fd={tap_target},mac={mac},offload_csum=off,offload_tso=off,offload_ufo=off"
+                    ));
                 } else {
-                    cmd.arg("--net").arg(format!("fd={tap_target}"));
+                    cmd.arg("--net").arg(format!(
+                        "fd={tap_target},offload_csum=off,offload_tso=off,offload_ufo=off"
+                    ));
                 }
             } else if net.mode == "bridge" || net.mode == "tap" {
                 if let Some(mac) = &net.mac {
-                    cmd.arg("--net")
-                        .arg(format!("tap={},mac={}", net.interface_name, mac));
+                    cmd.arg("--net").arg(format!(
+                        "tap={},mac={mac},offload_csum=off,offload_tso=off,offload_ufo=off",
+                        net.interface_name
+                    ));
                 } else {
-                    cmd.arg("--net").arg(format!("tap={}", net.interface_name));
+                    cmd.arg("--net").arg(format!(
+                        "tap={},offload_csum=off,offload_tso=off,offload_ufo=off",
+                        net.interface_name
+                    ));
                 }
             }
         }
@@ -246,7 +257,12 @@ impl HypervisorBackend for CloudHypervisorBackend {
         }
 
         cmd.stderr(Stdio::piped());
-        supervise_ch(&mut cmd, &bin_path, config, global)
+        let tap_names: Vec<String> = prep_nets
+            .iter()
+            .filter(|net| net.mode == "bridge" || net.mode == "tap")
+            .map(|net| net.interface_name.clone())
+            .collect();
+        supervise_ch(&mut cmd, &bin_path, config, global, &tap_names)
     }
 
     fn stop(&self, config: &VmConfig, global: &GlobalConfig) -> Result<()> {

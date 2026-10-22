@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use std::fs::{self, File, OpenOptions};
 use std::path::Path;
+use std::thread;
+use std::time::Duration;
 
 use crate::config::{BackendType, VmConfig};
 use crate::netlink;
@@ -141,8 +143,31 @@ impl NetworkManager {
             }
             return Err(err);
         }
-        crate::log::info(format!("disabled TX checksum offload on {ifname}"));
         Ok(())
+    }
+
+    /// cloud-hypervisor and QEMU call TUNSETOFFLOAD after they open the TAP,
+    /// which turns TX checksum back on. Re-apply until ethtool agrees it is off.
+    pub fn ensure_tap_tx_offload_off(names: &[String]) {
+        for name in names {
+            let mut off = false;
+            for _ in 0..40 {
+                if netlink::disable_tap_tx_offload(name).is_ok()
+                    && netlink::tx_checksum_enabled(name).ok() == Some(false)
+                {
+                    off = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            if off {
+                crate::log::info(format!("TAP {name} TX checksum offload is off"));
+            } else {
+                crate::log::warn(format!(
+                    "TAP {name} TX checksum offload is still on after hypervisor start"
+                ));
+            }
+        }
     }
 
     fn get_ifindex(ifname: &str) -> Result<u32> {

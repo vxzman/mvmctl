@@ -52,7 +52,7 @@
   - **QEMU**：支持 UEFI 固件启动（OVMF Code + Vars）、直接内核引导（`vmlinuz` / 带 PVH 的 `vmlinux`，initrd 可选）、SPICE 远程桌面、QMP 套接字优雅 ACPI 关机。
   - **Cloud-Hypervisor**：支持直接内核引导（带 PVH 的 `vmlinux` 或 `bzImage`，initrd 可选）、O_DIRECT 高吞吐存储、REST API 套接字优雅 ACPI 关机。
 - **网络原生编排**：
-  - 支持 **`macvtap`** 与 **`bridge` / `tap`** 模式。macvtap、主网卡和 up/down 走 netlink；tap 设备用 `/dev/net/tun` 的 `TUNSETIFF` 创建，不调用 `ip`。`bridge` / `tap` 在设备 up 之后关闭 TAP 的 TX checksum offload（TSO/GSO/GRO 一并关掉），避免网桥把未填完的 UDP 校验和送进客户机。
+  - 支持 **`macvtap`** 与 **`bridge` / `tap`** 模式。macvtap、主网卡和 up/down 走 netlink；tap 设备用 `/dev/net/tun` 的 `TUNSETIFF` 创建，不调用 `ip`。`bridge` / `tap` 关闭 TAP 的 TX checksum offload。cloud-hypervisor 打开 TAP 时会 `TUNSETOFFLOAD` 把校验和再打开，所以 `--net` 传 `offload_csum=off`，并在 hypervisor 起来后再关一次，避免网桥把未填完的 UDP 校验和送进客户机。
   - 自动管理接口命名规范（`qu-<name>` / `ch-<name>`），单/多网卡索引自动分配。
   - 关机后自动回收虚拟网络设备，防止网络接口泄漏。
 - **全生命周期自洽**：

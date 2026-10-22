@@ -79,6 +79,7 @@ fn supervise_qemu(
     bin_path: &Path,
     config: &VmConfig,
     global: &GlobalConfig,
+    tap_names: &[String],
 ) -> Result<()> {
     let mut restarts = Vec::new();
     loop {
@@ -87,6 +88,7 @@ fn supervise_qemu(
             .spawn()
             .with_context(|| format!("Failed to spawn QEMU process '{}'", bin_path.display()))?;
         ignore_sigint();
+        NetworkManager::ensure_tap_tx_offload_off(tap_names);
         if let Ok(mode) = global.socket_mode_bits() {
             if let Ok(paths) = control::socket_paths(global, config) {
                 control::tighten_sockets(paths, mode);
@@ -345,7 +347,12 @@ impl HypervisorBackend for QemuBackend {
         }
 
         cmd.stderr(Stdio::piped());
-        let result = supervise_qemu(&mut cmd, &bin_path, config, global);
+        let tap_names: Vec<String> = prep_nets
+            .iter()
+            .filter(|net| net.mode == "bridge" || net.mode == "tap")
+            .map(|net| net.interface_name.clone())
+            .collect();
+        let result = supervise_qemu(&mut cmd, &bin_path, config, global, &tap_names);
         drop(disk_locks);
         result
     }
